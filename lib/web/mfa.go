@@ -19,6 +19,7 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -91,7 +92,7 @@ type addMFADeviceRequest struct {
 // addMFADeviceHandle adds a new mfa device for the user defined in the token.
 func (h *Handler) addMFADeviceHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (interface{}, error) {
 	var req addMFADeviceRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -132,16 +133,17 @@ func (h *Handler) addMFADeviceHandle(w http.ResponseWriter, r *http.Request, par
 }
 
 type createAuthenticateChallengeRequest struct {
-	IsMFARequiredRequest *isMFARequiredRequest `json:"is_mfa_required_req"`
-	ChallengeScope       int                   `json:"challenge_scope"`
-	ChallengeAllowReuse  bool                  `json:"challenge_allow_reuse"`
+	IsMFARequiredRequest        *isMFARequiredRequest `json:"is_mfa_required_req"`
+	ChallengeScope              int                   `json:"challenge_scope"`
+	ChallengeAllowReuse         bool                  `json:"challenge_allow_reuse"`
+	UserVerificationRequirement string                `json:"user_verification_requirement"`
 }
 
 // createAuthenticateChallengeHandle creates and returns MFA authentication challenges for the user in context (logged in user).
 // Used when users need to re-authenticate their second factors.
 func (h *Handler) createAuthenticateChallengeHandle(w http.ResponseWriter, r *http.Request, p httprouter.Params, c *SessionContext) (interface{}, error) {
 	var req createAuthenticateChallengeRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -152,7 +154,7 @@ func (h *Handler) createAuthenticateChallengeHandle(w http.ResponseWriter, r *ht
 
 	var mfaRequiredCheckProto *proto.IsMFARequiredRequest
 	if req.IsMFARequiredRequest != nil {
-		mfaRequiredCheckProto, err = req.IsMFARequiredRequest.checkAndGetProtoRequest()
+		mfaRequiredCheckProto, err = h.checkAndGetProtoRequest(r.Context(), c, req.IsMFARequiredRequest)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -169,8 +171,9 @@ func (h *Handler) createAuthenticateChallengeHandle(w http.ResponseWriter, r *ht
 		},
 		MFARequiredCheck: mfaRequiredCheckProto,
 		ChallengeExtensions: &mfav1.ChallengeExtensions{
-			Scope:      mfav1.ChallengeScope(req.ChallengeScope),
-			AllowReuse: allowReuse,
+			Scope:                       mfav1.ChallengeScope(req.ChallengeScope),
+			AllowReuse:                  allowReuse,
+			UserVerificationRequirement: req.UserVerificationRequirement,
 		},
 	})
 	if err != nil {
@@ -183,7 +186,12 @@ func (h *Handler) createAuthenticateChallengeHandle(w http.ResponseWriter, r *ht
 // createAuthenticateChallengeWithTokenHandle creates and returns MFA authenticate challenges for the user defined in token.
 func (h *Handler) createAuthenticateChallengeWithTokenHandle(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
 	chal, err := h.cfg.ProxyClient.CreateAuthenticateChallenge(r.Context(), &proto.CreateAuthenticateChallengeRequest{
-		Request: &proto.CreateAuthenticateChallengeRequest_RecoveryStartTokenID{RecoveryStartTokenID: p.ByName("token")},
+		Request: &proto.CreateAuthenticateChallengeRequest_RecoveryStartTokenID{
+			RecoveryStartTokenID: p.ByName("token"),
+		},
+		ChallengeExtensions: &mfav1.ChallengeExtensions{
+			Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_ACCOUNT_RECOVERY,
+		},
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -290,6 +298,11 @@ type isMFARequiredWindowsDesktop struct {
 	Login string `json:"login"`
 }
 
+type isMFARequiredApp struct {
+	// ResolveAppParams contains info used to resolve an application
+	ResolveAppParams
+}
+
 type isMFARequiredAdminAction struct{}
 
 type isMFARequiredRequest struct {
@@ -305,11 +318,14 @@ type isMFARequiredRequest struct {
 	// Kube is the name of the kube cluster to check if target cluster
 	// requires MFA check.
 	Kube *isMFARequiredKube `json:"kube,omitempty"`
+	// App contains fields required to resolve an application and check if
+	// the target application requires MFA check.
+	App *isMFARequiredApp `json:"app,omitempty"`
 	// AdminAction is the name of the admin action RPC to check if MFA is required.
-	AdminAction *isMFARequiredAdminAction `json:"admin_action"`
+	AdminAction *isMFARequiredAdminAction `json:"admin_action,omitempty"`
 }
 
-func (r *isMFARequiredRequest) checkAndGetProtoRequest() (*proto.IsMFARequiredRequest, error) {
+func (h *Handler) checkAndGetProtoRequest(ctx context.Context, scx *SessionContext, r *isMFARequiredRequest) (*proto.IsMFARequiredRequest, error) {
 	numRequests := 0
 	var protoReq *proto.IsMFARequiredRequest
 
@@ -385,6 +401,22 @@ func (r *isMFARequiredRequest) checkAndGetProtoRequest() (*proto.IsMFARequiredRe
 		}
 	}
 
+	if r.App != nil {
+		resolvedApp, err := h.resolveApp(ctx, scx, r.App.ResolveAppParams)
+		if err != nil {
+			return nil, trace.Wrap(err, "unable to resolve FQDN: %v", r.App.FQDNHint)
+		}
+
+		numRequests++
+		protoReq = &proto.IsMFARequiredRequest{
+			Target: &proto.IsMFARequiredRequest_App{
+				App: &proto.RouteToApp{
+					Name: resolvedApp.App.GetName(),
+				},
+			},
+		}
+	}
+
 	if r.AdminAction != nil {
 		numRequests++
 		protoReq = &proto.IsMFARequiredRequest{
@@ -409,28 +441,39 @@ type isMfaRequiredResponse struct {
 	Required bool `json:"required"`
 }
 
+// isMFARequired is the [ClusterHandler] implementer for checking if MFA is required for a given target.
 func (h *Handler) isMFARequired(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	var httpReq *isMFARequiredRequest
-	if err := httplib.ReadJSON(r, &httpReq); err != nil {
+	if err := httplib.ReadResourceJSON(r, &httpReq); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	protoReq, err := httpReq.checkAndGetProtoRequest()
+	required, err := h.checkMFARequired(r.Context(), httpReq, sctx, site)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	clt, err := sctx.GetUserClient(r.Context(), site)
+	return isMfaRequiredResponse{Required: required}, nil
+}
+
+// checkMFARequired checks if MFA is required for the target specified in the [isMFARequiredRequest].
+func (h *Handler) checkMFARequired(ctx context.Context, req *isMFARequiredRequest, sctx *SessionContext, site reversetunnelclient.RemoteSite) (bool, error) {
+	protoReq, err := h.checkAndGetProtoRequest(ctx, sctx, req)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return false, trace.Wrap(err)
 	}
 
-	res, err := clt.IsMFARequired(r.Context(), protoReq)
+	clt, err := sctx.GetUserClient(ctx, site)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return false, trace.Wrap(err)
 	}
 
-	return isMfaRequiredResponse{Required: res.GetRequired()}, nil
+	res, err := clt.IsMFARequired(ctx, protoReq)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	return res.GetRequired(), nil
 }
 
 // makeAuthenticateChallenge converts proto to JSON format.

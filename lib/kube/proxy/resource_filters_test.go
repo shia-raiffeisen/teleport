@@ -124,6 +124,26 @@ func Test_filterBuffer(t *testing.T) {
 				"default/kubernetes",
 			},
 		},
+		{
+			name: "table response full object compressed with gzip",
+			args: args{
+				dataFile:        "testing/data/partial_table_full_obj.json",
+				contentEncoding: "gzip",
+			},
+			want: []string{
+				"default/kubernetes",
+			},
+		},
+		{
+			name: "table response full object uncompressed",
+			args: args{
+				dataFile:        "testing/data/partial_table_full_obj.json",
+				contentEncoding: "",
+			},
+			want: []string{
+				"default/kubernetes",
+			},
+		},
 	}
 	for _, tt := range tests {
 		for _, r := range types.KubernetesResourcesKinds {
@@ -211,7 +231,7 @@ func Test_filterBuffer(t *testing.T) {
 						if row.Object.Object == nil {
 							var err error
 							// decode only if row.Object.Object was not decoded before.
-							row.Object.Object, err = decodeAndSetGVK(decoder, row.Object.Raw)
+							row.Object.Object, err = decodeAndSetGVK(decoder, row.Object.Raw, nil)
 							require.NoError(t, err)
 						}
 

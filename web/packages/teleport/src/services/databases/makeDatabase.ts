@@ -21,7 +21,7 @@ import { formatDatabaseInfo } from 'shared/services/databases';
 import { Aws, Database, DatabaseService } from './types';
 
 export function makeDatabase(json: any): Database {
-  const { name, desc, protocol, type, aws } = json;
+  const { name, desc, protocol, type, aws, requiresRequest } = json;
 
   const labels = json.labels || [];
 
@@ -35,6 +35,7 @@ export function makeDatabase(json: any): Database {
         resourceId: aws.rds?.resource_id,
         region: aws.rds?.region,
         vpcId: aws.rds?.vpc_id,
+        securityGroups: aws.rds?.security_groups,
         subnets: aws.rds?.subnets || [],
       },
       iamPolicyStatus: aws.iam_policy_status,
@@ -52,6 +53,7 @@ export function makeDatabase(json: any): Database {
     users: json.database_users || [],
     hostname: json.hostname,
     aws: madeAws,
+    requiresRequest,
   };
 }
 

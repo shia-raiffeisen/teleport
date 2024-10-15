@@ -18,7 +18,7 @@
 
 import React from 'react';
 
-import { WelcomeWrapper } from 'design/Onboard/WelcomeWrapper';
+import { WelcomeWrapper } from 'teleport/components/Onboard';
 
 import {
   Route,
@@ -37,7 +37,7 @@ type WelcomeProps = {
   NewCredentials: (props: NewCredentialsContainerProps) => JSX.Element;
 };
 
-export default function Welcome({ NewCredentials }: WelcomeProps) {
+export function Welcome({ NewCredentials }: WelcomeProps) {
   const { tokenId } = useParams<{ tokenId: string }>();
   const { search } = useLocation();
 

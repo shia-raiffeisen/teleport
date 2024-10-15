@@ -16,7 +16,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useCallback } from 'react';
+import React, { useCallback, useRef } from 'react';
 import {
   Alert,
   Box,
@@ -27,6 +27,7 @@ import {
   MenuItem,
   Text,
   ButtonSecondary,
+  H1,
 } from 'design';
 import styled, { css } from 'styled-components';
 import { Transition } from 'react-transition-group';
@@ -146,6 +147,8 @@ export function Status(props: { closeDocument?: () => void }) {
     isRemoved ||
     isAgentIncompatibleOrUnknown;
 
+  const transitionRef = useRef<HTMLDivElement>();
+
   return (
     <Box maxWidth="680px" mx="auto" mt="4" px="5" width="100%">
       {shouldShowAgentUpgradeSuggestion(proxyVersion, {
@@ -181,8 +184,7 @@ export function Status(props: { closeDocument?: () => void }) {
       <Flex flexDirection="column" gap={3}>
         <Flex flexDirection="column" gap={1}>
           <Flex justifyContent="space-between">
-            <Text
-              typography="h3"
+            <H1
               css={`
                 display: flex;
               `}
@@ -190,7 +192,7 @@ export function Status(props: { closeDocument?: () => void }) {
               <icons.Laptop mr={2} />
               {/** The node name can be changed, so it might be different from the system hostname. */}
               {agentNode?.hostname || hostname}
-            </Text>
+            </H1>
             <MenuIcon
               Icon={icons.MoreVert}
               buttonIconProps={{
@@ -219,12 +221,13 @@ export function Status(props: { closeDocument?: () => void }) {
 
           <Transition
             in={!!agentNode}
+            nodeRef={transitionRef}
             timeout={1_800}
             mountOnEnter
             unmountOnExit
           >
             {state => (
-              <LabelsContainer gap={1} className={state}>
+              <LabelsContainer gap={1} className={state} ref={transitionRef}>
                 {/* Explicitly check for existence of agentNode because Transition doesn't seem to
                 unmount immediately when `in` becomes falsy. */}
                 {agentNode?.labels && renderLabels(agentNode.labels)}
@@ -234,7 +237,7 @@ export function Status(props: { closeDocument?: () => void }) {
         </Flex>
 
         <Flex flexDirection="column" gap={2}>
-          <Flex gap={1} display="flex" alignItems="center" minHeight="32px">
+          <Flex gap={1} alignItems="center" minHeight="32px">
             {prettyCurrentAction.Icon && (
               <prettyCurrentAction.Icon size="medium" />
             )}

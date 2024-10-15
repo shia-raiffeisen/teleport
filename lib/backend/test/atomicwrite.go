@@ -21,24 +21,18 @@ package test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/gravitational/teleport/lib/backend"
 )
 
-// AtomicWriteConstructor is equivalent to [Constructor], except that it includes the new AtomicWrite method. This type
-// will be deprecated once all backends implement AtomicWrite.
-type AtomicWriteConstructor func(options ...ConstructionOption) (backend.AtomicWriterBackend, clockwork.FakeClock, error)
-
-func RunAtomicWriteComplianceSuite(t *testing.T, newBackend AtomicWriteConstructor) {
+func RunAtomicWriteComplianceSuite(t *testing.T, newBackend Constructor) {
 	t.Run("Move", func(t *testing.T) {
 		testAtomicWriteMove(t, newBackend)
 	})
@@ -65,7 +59,7 @@ func RunAtomicWriteComplianceSuite(t *testing.T, newBackend AtomicWriteConstruct
 }
 
 // testAtomicWriteMove verifies the correct behavior of "move" operations.
-func testAtomicWriteMove(t *testing.T, newBackend AtomicWriteConstructor) {
+func testAtomicWriteMove(t *testing.T, newBackend Constructor) {
 	bk, _, err := newBackend()
 	require.NoError(t, err)
 
@@ -127,7 +121,7 @@ func testAtomicWriteMove(t *testing.T, newBackend AtomicWriteConstructor) {
 
 // testAtomicWriteLock verifies correct behavior of various "lock" patterns (i.e. where some update on key X is conditional on
 // the state of key Y).
-func testAtomicWriteLock(t *testing.T, newBackend AtomicWriteConstructor) {
+func testAtomicWriteLock(t *testing.T, newBackend Constructor) {
 	bk, _, err := newBackend()
 	require.NoError(t, err)
 
@@ -281,7 +275,7 @@ func testAtomicWriteLock(t *testing.T, newBackend AtomicWriteConstructor) {
 }
 
 // testAtomicWriteMax verifies correct behavior of very large atomic writes.
-func testAtomicWriteMax(t *testing.T, newBackend AtomicWriteConstructor) {
+func testAtomicWriteMax(t *testing.T, newBackend Constructor) {
 	bk, _, err := newBackend()
 	require.NoError(t, err)
 
@@ -290,8 +284,8 @@ func testAtomicWriteMax(t *testing.T, newBackend AtomicWriteConstructor) {
 
 	prefix := MakePrefix()
 
-	keyOf := func(i int) []byte {
-		return prefix(fmt.Sprintf("/key-%d", i))
+	keyOf := func(i int) backend.Key {
+		return prefix("key-" + strconv.Itoa(i))
 	}
 
 	var condacts []backend.ConditionalAction
@@ -367,7 +361,7 @@ func testAtomicWriteMax(t *testing.T, newBackend AtomicWriteConstructor) {
 }
 
 // testAtomicWriteConcurrent is a sanity-check intended to verify the correctness of AtomicWrite under high concurrency.
-func testAtomicWriteConcurrent(t *testing.T, newBackend AtomicWriteConstructor) {
+func testAtomicWriteConcurrent(t *testing.T, newBackend Constructor) {
 	const (
 		increments = 200
 		workers    = 20
@@ -460,7 +454,7 @@ func testAtomicWriteConcurrent(t *testing.T, newBackend AtomicWriteConstructor) 
 // testAtomicWriteNonConflicting verifies that non-conflicting but overlapping transactions all succeed
 // on the first attempt when running concurrently, meaning that backends that treat overlap as conflict (e.g. dynamo)
 // handle such conflicts internally.
-func testAtomicWriteNonConflicting(t *testing.T, newBackend AtomicWriteConstructor) {
+func testAtomicWriteNonConflicting(t *testing.T, newBackend Constructor) {
 	const workers = 60
 
 	bk, _, err := newBackend()
@@ -473,10 +467,10 @@ func testAtomicWriteNonConflicting(t *testing.T, newBackend AtomicWriteConstruct
 
 	results := make(chan error, workers)
 
-	commonKey := prefix("/common")
+	commonKey := prefix("common")
 
-	itemKey := func(i int) []byte {
-		return prefix(fmt.Sprintf("/item-%d", i))
+	itemKey := func(i int) backend.Key {
+		return prefix("item-" + strconv.Itoa(i))
 	}
 
 	_, err = bk.Put(ctx, backend.Item{
@@ -527,7 +521,7 @@ func testAtomicWriteNonConflicting(t *testing.T, newBackend AtomicWriteConstruct
 // testAtomicWriteOther verifies some minor edge-cases that may not be covered by other tests. Specifically,
 // it verifies that Item.Key has no effect on writes or subsequent reads, and that ineffectual writes still
 // update the value of revision.
-func testAtomicWriteOther(t *testing.T, newBackend AtomicWriteConstructor) {
+func testAtomicWriteOther(t *testing.T, newBackend Constructor) {
 	bk, _, err := newBackend()
 	require.NoError(t, err)
 
@@ -536,7 +530,7 @@ func testAtomicWriteOther(t *testing.T, newBackend AtomicWriteConstructor) {
 
 	prefix := MakePrefix()
 
-	fooKey, barKey, badKey := prefix("/foo"), prefix("/bar"), prefix("/bad")
+	fooKey, barKey, badKey := prefix("foo"), prefix("bar"), prefix("bad")
 
 	fooVal, barVal := []byte("foo"), []byte("bar")
 

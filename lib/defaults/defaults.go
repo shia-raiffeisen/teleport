@@ -28,7 +28,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-jose/go-jose/v3"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"golang.org/x/crypto/ssh"
@@ -99,9 +98,6 @@ const (
 
 	// By default SSH server (and SSH proxy) will bind to this IP
 	BindIP = "0.0.0.0"
-
-	// By default all users use /bin/bash
-	DefaultShell = "/bin/bash"
 
 	// GRPCMaxConcurrentStreams is the max GRPC streams that can be active at a time.  Once the limit is reached new
 	// RPC calls will queue until capacity is available.
@@ -315,10 +311,6 @@ const (
 	// LowResPollingPeriod is a default low resolution polling period
 	LowResPollingPeriod = 600 * time.Second
 
-	// HighResReportingPeriod is a high resolution polling reporting
-	// period used in services
-	HighResReportingPeriod = 10 * time.Second
-
 	// SessionControlTimeout is the maximum amount of time a controlled session
 	// may persist after contact with the auth server is lost (sessctl semaphore
 	// leases are refreshed at a rate of ~1/2 this duration).
@@ -378,9 +370,6 @@ var (
 const (
 	// LimiterMaxConnections Number of max. simultaneous connections to a service
 	LimiterMaxConnections = 15000
-
-	// LimiterMaxConcurrentUsers Number of max. simultaneous connected users/logins
-	LimiterMaxConcurrentUsers = 250
 
 	// LimiterMaxConcurrentSignatures limits maximum number of concurrently
 	// generated signatures by the auth server
@@ -482,6 +471,8 @@ const (
 	ProtocolClickHouse = "clickhouse"
 	// ProtocolClickHouseHTTP is the ClickHouse database HTTP protocol.
 	ProtocolClickHouseHTTP = "clickhouse-http"
+	// ProtocolSpanner is the GCP Spanner database protocol.
+	ProtocolSpanner = "spanner"
 )
 
 // DatabaseProtocols is a list of all supported database protocols.
@@ -500,6 +491,7 @@ var DatabaseProtocols = []string{
 	ProtocolDynamoDB,
 	ProtocolClickHouse,
 	ProtocolClickHouseHTTP,
+	ProtocolSpanner,
 }
 
 // ReadableDatabaseProtocol returns a more human-readable string of the
@@ -534,6 +526,8 @@ func ReadableDatabaseProtocol(p string) string {
 		return "Clickhouse"
 	case ProtocolClickHouseHTTP:
 		return "Clickhouse (HTTP)"
+	case ProtocolSpanner:
+		return "GCloud Spanner"
 	default:
 		// Unknown protocol. Return original string.
 		return p
@@ -629,7 +623,6 @@ const (
 // ConfigureLimiter assigns the default parameters to a connection throttler (AKA limiter)
 func ConfigureLimiter(lc *limiter.Config) {
 	lc.MaxConnections = LimiterMaxConnections
-	lc.MaxNumberOfUsers = LimiterMaxConcurrentUsers
 }
 
 // AuthListenAddr returns the default listening address for the Auth service
@@ -725,6 +718,9 @@ const (
 
 	// WebsocketLatency provides latency information for a session.
 	WebsocketLatency = "l"
+
+	// WebsocketKubeExec provides latency information for a session.
+	WebsocketKubeExec = "k"
 )
 
 // The following are cryptographic primitives Teleport does not support in
@@ -737,13 +733,6 @@ const (
 )
 
 const (
-	// ApplicationTokenKeyType is the type of asymmetric key used to sign tokens.
-	// See https://tools.ietf.org/html/rfc7518#section-6.1 for possible values.
-	ApplicationTokenKeyType = "RSA"
-	// ApplicationTokenAlgorithm is the default algorithm used to sign
-	// application access tokens.
-	ApplicationTokenAlgorithm = jose.RS256
-
 	// JWTUse is the default usage of the JWT.
 	// See https://www.rfc-editor.org/rfc/rfc7517#section-4.2 for more information.
 	JWTUse = "sig"

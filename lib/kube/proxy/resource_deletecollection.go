@@ -139,7 +139,9 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 	req.Body.Close()
 
 	// decode memory rw body.
-	obj, err := decodeAndSetGVK(decoder, memWriter.Buffer().Bytes())
+	// We are reading an API request and API honors the GVK in the request so we don't
+	// need to set it.
+	obj, err := decodeAndSetGVK(decoder, memWriter.Buffer().Bytes(), nil /* defaults GVK */)
 	if err != nil {
 		return internalErrStatus, trace.Wrap(err)
 	}
@@ -552,7 +554,7 @@ func (f *Forwarder) handleDeleteCustomResourceCollection(w http.ResponseWriter, 
 	kubeUsers, kubeGroups := fillDefaultKubePrincipalDetails(allowedKubeGroups, allowedKubeUsers, sess.User.GetName())
 	sess.kubeUsers = utils.StringsSet(kubeUsers)
 	sess.kubeGroups = utils.StringsSet(kubeGroups)
-	if err := setupImpersonationHeaders(f.log, sess, req.Header); err != nil {
+	if err := setupImpersonationHeaders(sess, req.Header); err != nil {
 		return 0, trace.Wrap(err)
 	}
 

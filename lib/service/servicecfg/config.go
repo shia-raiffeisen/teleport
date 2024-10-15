@@ -20,6 +20,7 @@
 package servicecfg
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -32,17 +33,16 @@ import (
 	"github.com/ghodss/yaml"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sashabaranov/go-openai"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/breaker"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/state"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
-	"github.com/gravitational/teleport/lib/cloud"
+	"github.com/gravitational/teleport/lib/cloud/imds"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/plugin"
@@ -50,6 +50,7 @@ import (
 	"github.com/gravitational/teleport/lib/sshca"
 	usagereporter "github.com/gravitational/teleport/lib/usagereporter/teleport"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // Config contains the configuration for all services that Teleport can run.
@@ -57,8 +58,7 @@ import (
 type Config struct {
 	// Teleport configuration version.
 	Version string
-	// DataDir is the directory where teleport stores its permanent state
-	// (in case of auth server backed by BoltDB) or local state, e.g. keys
+	// DataDir is the directory where teleport stores its local state, e.g. keys
 	DataDir string
 
 	// Hostname is a node host name
@@ -75,7 +75,7 @@ type Config struct {
 
 	// Identities is an optional list of pre-generated key pairs
 	// for teleport roles, this is helpful when server is preconfigured
-	Identities []*auth.Identity
+	Identities []*state.Identity
 
 	// AdvertiseIP is used to "publish" an alternative IP address or hostname this node
 	// can be reached on, if running behind NAT
@@ -103,6 +103,9 @@ type Config struct {
 
 	// Metrics defines the metrics service configuration.
 	Metrics MetricsConfig
+
+	// DebugService defines the debug service configuration.
+	DebugService DebugConfig
 
 	// WindowsDesktop defines the Windows desktop service configuration.
 	WindowsDesktop WindowsDesktopConfig
@@ -143,7 +146,7 @@ type Config struct {
 	PIDFile string
 
 	// Trust is a service that manages certificate authorities
-	Trust services.Trust
+	Trust services.TrustInternal
 
 	// Presence service is a discovery and heartbeat tracker
 	Presence services.PresenceInternal
@@ -164,6 +167,9 @@ type Config struct {
 	UsageReporter usagereporter.UsageReporter
 	// ClusterConfiguration is a service that provides cluster configuration
 	ClusterConfiguration services.ClusterConfiguration
+
+	// AutoUpdateService is a service that provides auto update configuration and version.
+	AutoUpdateService services.AutoUpdateService
 
 	// CipherSuites is a list of TLS ciphersuites that Teleport supports. If
 	// omitted, a Teleport selected list of defaults will be used.
@@ -218,9 +224,13 @@ type Config struct {
 	// Log optionally specifies the logger.
 	// Deprecated: use Logger instead.
 	Log utils.Logger
+
 	// Logger outputs messages using slog. The underlying handler respects
 	// the user supplied logging config.
 	Logger *slog.Logger
+
+	// LoggerLevel defines the Logger log level.
+	LoggerLevel *slog.LevelVar
 
 	// PluginRegistry allows adding enterprise logic to Teleport services
 	PluginRegistry plugin.Registry
@@ -246,7 +256,7 @@ type Config struct {
 	AdditionalReadyEvents []string
 
 	// InstanceMetadataClient specifies the instance metadata client.
-	InstanceMetadataClient cloud.InstanceMetadata
+	InstanceMetadataClient imds.Client
 
 	// Testing is a group of properties that are used in tests.
 	Testing ConfigTesting
@@ -297,15 +307,6 @@ type ConfigTesting struct {
 	// require PROXY header if 'proxyProtocolMode: true' even from self connections. Used in tests as all connections are self
 	// connections there.
 	KubeMultiplexerIgnoreSelfConnections bool
-
-	// OpenAIConfig contains the optional OpenAI client configuration used by
-	// auth and proxy. When it's not set (the default, we don't offer a way to
-	// set it when executing the regular Teleport binary) we use the default
-	// configuration with auth tokens passed from Auth.AssistAPIKey or
-	// Proxy.AssistAPIKey. We set this only when testing to avoid calls to reach
-	// the real OpenAI API.
-	// Note: When set, this overrides Auth and Proxy's AssistAPIKey settings.
-	OpenAIConfig *openai.ClientConfig
 }
 
 // AccessGraphConfig represents TAG server config
@@ -515,6 +516,10 @@ func ApplyDefaults(cfg *Config) {
 		cfg.Logger = slog.Default()
 	}
 
+	if cfg.LoggerLevel == nil {
+		cfg.LoggerLevel = new(slog.LevelVar)
+	}
+
 	// Remove insecure and (borderline insecure) cryptographic primitives from
 	// default configuration. These can still be added back in file configuration by
 	// users, but not supported by default by Teleport. See #1856 for more
@@ -529,7 +534,7 @@ func ApplyDefaults(cfg *Config) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "localhost"
-		cfg.Log.Errorf("Failed to determine hostname: %v.", err)
+		cfg.Logger.ErrorContext(context.Background(), "Failed to determine hostname", "error", err)
 	}
 
 	// Global defaults.
@@ -552,7 +557,6 @@ func ApplyDefaults(cfg *Config) {
 	cfg.Auth.SessionRecordingConfig = types.DefaultSessionRecordingConfig()
 	cfg.Auth.Preference = types.DefaultAuthPreference()
 	defaults.ConfigureLimiter(&cfg.Auth.Limiter)
-	cfg.Auth.LicenseFile = filepath.Join(cfg.DataDir, defaults.LicenseFile)
 
 	cfg.Proxy.WebAddr = *defaults.ProxyWebListenAddr()
 	// Proxy service defaults.
@@ -564,7 +568,6 @@ func ApplyDefaults(cfg *Config) {
 
 	// SSH service defaults.
 	cfg.SSH.Enabled = true
-	cfg.SSH.Shell = defaults.DefaultShell
 	defaults.ConfigureLimiter(&cfg.SSH.Limiter)
 	cfg.SSH.PAM = &PAMConfig{Enabled: false}
 	cfg.SSH.BPF = &BPFConfig{Enabled: false}
@@ -593,6 +596,9 @@ func ApplyDefaults(cfg *Config) {
 	cfg.MaxRetryPeriod = defaults.MaxWatcherBackoff
 	cfg.Testing.ConnectFailureC = make(chan time.Duration, 1)
 	cfg.CircuitBreakerConfig = breaker.DefaultBreakerConfig(cfg.Clock)
+
+	// Debug service defaults.
+	cfg.DebugService.Enabled = true
 }
 
 // FileDescriptor is a file descriptor associated
@@ -680,6 +686,10 @@ func applyDefaults(cfg *Config) {
 		cfg.Logger = slog.Default()
 	}
 
+	if cfg.LoggerLevel == nil {
+		cfg.LoggerLevel = new(slog.LevelVar)
+	}
+
 	if cfg.PollingPeriod == 0 {
 		cfg.PollingPeriod = defaults.LowResPollingPeriod
 	}
@@ -711,7 +721,7 @@ func validateAuthOrProxyServices(cfg *Config) error {
 		if haveProxyServer {
 			port := cfg.ProxyServer.Port(0)
 			if port == defaults.AuthListenPort {
-				cfg.Log.Warnf("config: proxy_server is pointing to port %d, is this the auth server address?", defaults.AuthListenPort)
+				cfg.Logger.WarnContext(context.Background(), "config: proxy_server is pointing to port 3025, is this the auth server address?")
 			}
 		}
 
@@ -720,7 +730,7 @@ func validateAuthOrProxyServices(cfg *Config) error {
 			checkPorts := []int{defaults.HTTPListenPort, teleport.StandardHTTPSPort}
 			for _, port := range checkPorts {
 				if authServerPort == port {
-					cfg.Log.Warnf("config: auth_server is pointing to port %d, is this the proxy server address?", port)
+					cfg.Logger.WarnContext(context.Background(), "config: auth_server is pointing to port 3080 or 443, is this the proxy server address?")
 				}
 			}
 		}
@@ -762,4 +772,18 @@ func verifyEnabledService(cfg *Config) error {
 
 	return trace.BadParameter(
 		"config: enable at least one of auth_service, ssh_service, proxy_service, app_service, database_service, kubernetes_service, windows_desktop_service, discovery_service, okta_service or jamf_service")
+}
+
+// SetLogLevel changes the loggers log level.
+//
+// If called after `config.ApplyFileConfig` or `config.Configure` it will also
+// change the global loggers.
+func (c *Config) SetLogLevel(level slog.Level) {
+	c.Log.SetLevel(logutils.SlogLevelToLogrusLevel(level))
+	c.LoggerLevel.Set(level)
+}
+
+// GetLogLevel returns the current log level.
+func (c *Config) GetLogLevel() slog.Level {
+	return c.LoggerLevel.Level()
 }

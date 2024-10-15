@@ -20,17 +20,15 @@
 import { useState, useEffect, useRef } from 'react';
 import { Attempt } from 'shared/hooks/useAttemptNext';
 import { NotificationItem } from 'shared/components/Notification';
-
-import { Platform, getPlatform } from 'design/platform';
+import { debounce } from 'shared/utils/highbar';
 
 import { TdpClient, ButtonState, ScrollAxis } from 'teleport/lib/tdp';
 import {
   ClientScreenSpec,
   ClipboardData,
   PngFrame,
-  SyncKeys,
 } from 'teleport/lib/tdp/codec';
-import { getAccessToken, getHostName } from 'teleport/services/api';
+import { getHostName } from 'teleport/services/api';
 import cfg from 'teleport/config';
 import { Sha256Digest } from 'teleport/lib/util';
 
@@ -44,6 +42,7 @@ import {
   defaultDirectorySharingState,
   isSharingClipboard,
 } from './useDesktopSession';
+import { KeyboardHandler } from './KeyboardHandler';
 
 import type { BitmapFrame } from 'teleport/lib/tdp/client';
 
@@ -63,43 +62,39 @@ export default function useTdpClientCanvas(props: Props) {
     clipboardSharingState,
     setClipboardSharingState,
     setDirectorySharingState,
-    setWarnings,
+    setAlerts,
   } = props;
   const [tdpClient, setTdpClient] = useState<TdpClient | null>(null);
   const initialTdpConnectionSucceeded = useRef(false);
   const encoder = useRef(new TextEncoder());
   const latestClipboardDigest = useRef('');
+  const keyboardHandler = useRef(new KeyboardHandler());
 
-  /**
-   * Tracks whether the next keydown or keyup event should sync the
-   * local toggle key state to the remote machine.
-   *
-   * Set to true:
-   * - On component initialization, so keys are synced before the first keydown/keyup event.
-   * - On focusout, so keys are synced when the user returns to the window.
-   */
-  const syncBeforeNextKey = useRef(true);
+  useEffect(() => {
+    keyboardHandler.current = new KeyboardHandler();
+    // On unmount, clear all the timeouts on the keyboardHandler.
+    return () => {
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      keyboardHandler.current.dispose();
+    };
+  }, []);
 
   useEffect(() => {
     const addr = cfg.api.desktopWsAddr
       .replace(':fqdn', getHostName())
       .replace(':clusterId', clusterId)
       .replace(':desktopName', desktopName)
-      .replace(':token', getAccessToken())
       .replace(':username', username);
 
     setTdpClient(new TdpClient(addr));
   }, [clusterId, username, desktopName]);
 
-  const syncCanvasResolutionAndSize = (canvas: HTMLCanvasElement) => {
-    const { width, height } = getDisplaySize();
-
-    // Set a fixed canvas resolution and display size. This ensures
-    // that neither of these change when the user resizes the browser
-    // window. Instead, the canvas will remain the same size and the
-    // browser will add scrollbars if necessary. This is the behavior
-    // we want until https://github.com/gravitational/teleport/issues/9702
-    // is resolved.
+  /**
+   * Synchronize the canvas resolution and display size with the
+   * given ClientScreenSpec.
+   */
+  const syncCanvas = (canvas: HTMLCanvasElement, spec: ClientScreenSpec) => {
+    const { width, height } = spec;
     canvas.width = width;
     canvas.height = height;
     console.debug(`set canvas.width x canvas.height to ${width} x ${height}`);
@@ -117,7 +112,7 @@ export default function useTdpClientCanvas(props: Props) {
   ) => {
     // The first image fragment we see signals a successful TDP connection.
     if (!initialTdpConnectionSucceeded.current) {
-      syncCanvasResolutionAndSize(ctx.canvas);
+      syncCanvas(ctx.canvas, getDisplaySize());
       setTdpConnection({ status: 'success' });
       initialTdpConnectionSucceeded.current = true;
     }
@@ -131,7 +126,6 @@ export default function useTdpClientCanvas(props: Props) {
   ) => {
     // The first image fragment we see signals a successful TDP connection.
     if (!initialTdpConnectionSucceeded.current) {
-      syncCanvasResolutionAndSize(ctx.canvas);
       setTdpConnection({ status: 'success' });
       initialTdpConnectionSucceeded.current = true;
     }
@@ -144,15 +138,7 @@ export default function useTdpClientCanvas(props: Props) {
     canvas: HTMLCanvasElement,
     spec: ClientScreenSpec
   ) => {
-    const { width, height } = spec;
-    canvas.width = width;
-    canvas.height = height;
-    console.debug(`set canvas.width x canvas.height to ${width} x ${height}`);
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    console.debug(
-      `set canvas.style.width x canvas.style.height to ${width} x ${height}`
-    );
+    syncCanvas(canvas, spec);
   };
 
   // Default TdpClientEvent.TDP_CLIPBOARD_DATA handler.
@@ -171,15 +157,24 @@ export default function useTdpClientCanvas(props: Props) {
   const clientOnTdpError = (error: Error) => {
     setDirectorySharingState(defaultDirectorySharingState);
     setClipboardSharingState(defaultClipboardSharingState);
-    setTdpConnection({
-      status: 'failed',
-      statusText: error.message || error.toString(),
+    setTdpConnection(prevState => {
+      // Sometimes when a connection closes due to an error, we get a cascade of
+      // errors. Here we update the status only if it's not already 'failed', so
+      // that the first error message (which is usually the most informative) is
+      // displayed to the user.
+      if (prevState.status !== 'failed') {
+        return {
+          status: 'failed',
+          statusText: error.message || error.toString(),
+        };
+      }
+      return prevState;
     });
   };
 
   // Default TdpClientEvent.TDP_WARNING and TdpClientEvent.CLIENT_WARNING handler
   const clientOnTdpWarning = (warning: string) => {
-    setWarnings(prevState => {
+    setAlerts(prevState => {
       return [
         ...prevState,
         {
@@ -191,102 +186,37 @@ export default function useTdpClientCanvas(props: Props) {
     });
   };
 
-  const clientOnWsClose = () => {
-    setWsConnection('closed');
+  // TODO(zmb3): this is not what an info-level alert should do.
+  // rename it to something like onGracefulDisconnect
+  const clientOnTdpInfo = (info: string) => {
+    setDirectorySharingState(defaultDirectorySharingState);
+    setClipboardSharingState(defaultClipboardSharingState);
+    setTdpConnection({
+      status: '', // gracefully disconnecting
+      statusText: info,
+    });
+  };
+
+  const clientOnWsClose = (statusText: string) => {
+    setWsConnection({ status: 'closed', statusText });
   };
 
   const clientOnWsOpen = () => {
-    setWsConnection('open');
-  };
-
-  /**
-   * Returns the ButtonState corresponding to the given `keyArg`.
-   *
-   * @param e The `KeyboardEvent`
-   * @param keyArg The key to check the state of. Valid values can be found [here](https://www.w3.org/TR/uievents-key/#keys-modifier)
-   */
-  const getModifierState = (e: KeyboardEvent, keyArg: string): ButtonState => {
-    return e.getModifierState(keyArg) ? ButtonState.DOWN : ButtonState.UP;
-  };
-
-  const getSyncKeys = (e: KeyboardEvent): SyncKeys => {
-    return {
-      scrollLockState: getModifierState(e, 'ScrollLock'),
-      numLockState: getModifierState(e, 'NumLock'),
-      capsLockState: getModifierState(e, 'CapsLock'),
-      kanaLockState: ButtonState.UP, // KanaLock is not supported, see https://www.w3.org/TR/uievents-key/#keys-modifier
-    };
-  };
-
-  /**
-   * Called before every keydown or keyup event.
-   *
-   * If syncBeforeNextKey is true, this function
-   * synchronizes the keys to the remote machine.
-   */
-  const handleSyncBeforeNextKey = (cli: TdpClient, e: KeyboardEvent) => {
-    if (syncBeforeNextKey.current === true) {
-      cli.sendSyncKeys(getSyncKeys(e));
-      syncBeforeNextKey.current = false;
-    }
-  };
-
-  const isMac = getPlatform() === Platform.macOS;
-  /**
-   * Special handler for the CapsLock key.
-   *
-   * On MacOS Edge/Chrome/Safari, each physical CapsLock DOWN-UP registers
-   * as either a single DOWN or single UP, with DOWN corresponding to
-   * "CapsLock on" and UP to "CapsLock off". On MacOS Firefox, it always
-   * registers as a DOWN.
-   *
-   * On Windows and Linux, all browsers treat CapsLock like a normal key.
-   *
-   * The remote Windows machine also treats CapsLock like a normal key, and
-   * expects a DOWN-UP whenever it's pressed.
-   */
-  const handleCapsLock = (cli: TdpClient, state: ButtonState) => {
-    if (isMac) {
-      // On Mac, every UP or DOWN given to us by the browser corresponds
-      // to a DOWN + UP on the remote machine.
-      cli.sendKeyboardInput('CapsLock', ButtonState.DOWN);
-      cli.sendKeyboardInput('CapsLock', ButtonState.UP);
-    } else {
-      // On Windows or Linux, we just pass the event through normally to the server.
-      cli.sendKeyboardInput('CapsLock', state);
-    }
-  };
-
-  /**
-   * Handles a keyboard event.
-   */
-  const handleKeyboardEvent = (
-    cli: TdpClient,
-    e: KeyboardEvent,
-    state: ButtonState
-  ) => {
-    if (e.code === 'CapsLock') {
-      handleCapsLock(cli, state);
-      return;
-    }
-    cli.sendKeyboardInput(e.code, state);
+    setWsConnection({ status: 'open' });
   };
 
   const canvasOnKeyDown = (cli: TdpClient, e: KeyboardEvent) => {
-    e.preventDefault();
-    handleSyncBeforeNextKey(cli, e);
-    handleKeyboardEvent(cli, e, ButtonState.DOWN);
+    keyboardHandler.current.handleKeyboardEvent({
+      cli,
+      e,
+      state: ButtonState.DOWN,
+    });
 
     // The key codes in the if clause below are those that have been empirically determined not
     // to count as transient activation events. According to the documentation, a keydown for
     // the Esc key and any "shortcut key reserved by the user agent" don't count as activation
     // events: https://developer.mozilla.org/en-US/docs/Web/Security/User_activation.
-    if (
-      e.code !== 'MetaRight' &&
-      e.code !== 'MetaLeft' &&
-      e.code !== 'AltRight' &&
-      e.code !== 'AltLeft'
-    ) {
+    if (e.key !== 'Meta' && e.key !== 'Alt' && e.key !== 'Escape') {
       // Opportunistically sync local clipboard to remote while
       // transient user activation is in effect.
       // https://developer.mozilla.org/en-US/docs/Web/API/Clipboard/readText#security
@@ -295,13 +225,15 @@ export default function useTdpClientCanvas(props: Props) {
   };
 
   const canvasOnKeyUp = (cli: TdpClient, e: KeyboardEvent) => {
-    e.preventDefault();
-    handleSyncBeforeNextKey(cli, e);
-    handleKeyboardEvent(cli, e, ButtonState.UP);
+    keyboardHandler.current.handleKeyboardEvent({
+      cli,
+      e,
+      state: ButtonState.UP,
+    });
   };
 
   const canvasOnFocusOut = () => {
-    syncBeforeNextKey.current = true;
+    keyboardHandler.current.onFocusOut();
   };
 
   const canvasOnMouseMove = (
@@ -350,6 +282,15 @@ export default function useTdpClientCanvas(props: Props) {
   // on the remote machine.
   const canvasOnContextMenu = () => false;
 
+  const windowOnResize = debounce(
+    (cli: TdpClient) => {
+      const spec = getDisplaySize();
+      cli.resize(spec);
+    },
+    250,
+    { trailing: true }
+  );
+
   const sendLocalClipboardToRemote = async (cli: TdpClient) => {
     if (await sysClipboardGuard(clipboardSharingState, 'read')) {
       navigator.clipboard.readText().then(text => {
@@ -376,6 +317,7 @@ export default function useTdpClientCanvas(props: Props) {
     clientOnWsClose,
     clientOnWsOpen,
     clientOnTdpWarning,
+    clientOnTdpInfo,
     canvasOnKeyDown,
     canvasOnKeyUp,
     canvasOnFocusOut,
@@ -384,6 +326,7 @@ export default function useTdpClientCanvas(props: Props) {
     canvasOnMouseUp,
     canvasOnMouseWheelScroll,
     canvasOnContextMenu,
+    windowOnResize,
   };
 }
 
@@ -402,11 +345,11 @@ type Props = {
   desktopName: string;
   clusterId: string;
   setTdpConnection: Setter<Attempt>;
-  setWsConnection: Setter<'open' | 'closed'>;
+  setWsConnection: Setter<{ status: 'open' | 'closed'; statusText?: string }>;
   clipboardSharingState: ClipboardSharingState;
   setClipboardSharingState: Setter<ClipboardSharingState>;
   setDirectorySharingState: Setter<DirectorySharingState>;
-  setWarnings: Setter<NotificationItem[]>;
+  setAlerts: Setter<NotificationItem[]>;
 };
 
 /**

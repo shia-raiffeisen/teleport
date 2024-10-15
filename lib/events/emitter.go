@@ -22,14 +22,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -100,7 +101,7 @@ func (a *AsyncEmitter) forward() {
 				if a.ctx.Err() != nil {
 					return
 				}
-				log.WithError(err).Errorf("Failed to emit audit event.")
+				slog.ErrorContext(a.ctx, "Failed to emit audit event.", "error", err)
 			}
 		}
 	}
@@ -115,7 +116,7 @@ func (a *AsyncEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audit
 	case <-ctx.Done():
 		return trace.ConnectionProblem(ctx.Err(), "context canceled or closed")
 	default:
-		log.Errorf("Failed to emit audit event %v(%v). This server's connection to the auth service appears to be slow.", event.GetType(), event.GetCode())
+		slog.ErrorContext(ctx, "Failed to emit audit event. This server's connection to the auth service appears to be slow.", "event_type", event.GetType(), "event_code", event.GetCode())
 		return nil
 	}
 }
@@ -170,13 +171,13 @@ func (r *CheckingEmitter) EmitAuditEvent(ctx context.Context, event apievents.Au
 	auditEmitEvent.Inc()
 	auditEmitEventSizes.Observe(float64(event.Size()))
 	if err := checkAndSetEventFields(event, r.Clock, r.UIDGenerator, r.ClusterName); err != nil {
-		log.WithError(err).Errorf("Failed to emit audit event.")
+		slog.ErrorContext(ctx, "Failed to emit audit event.", "error", err)
 		AuditFailedEmit.Inc()
 		return trace.Wrap(err)
 	}
 	if err := r.Inner.EmitAuditEvent(ctx, event); err != nil {
 		AuditFailedEmit.Inc()
-		log.WithError(err).Errorf("Failed to emit audit event of type: %s.", event.GetType())
+		slog.ErrorContext(ctx, "Failed to emit audit event of type", "event_type", event.GetType(), "error", err)
 		return trace.Wrap(err)
 	}
 	return nil
@@ -247,17 +248,26 @@ func (w *WriterEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audi
 }
 
 // NewLoggingEmitter returns an emitter that logs all events to the console
-// with the info level
-func NewLoggingEmitter() *LoggingEmitter {
-	return &LoggingEmitter{}
+// with the info level. Events are only logged for self-hosted installations,
+// Teleport Cloud treats this as a no-op.
+func NewLoggingEmitter(cloud bool) *LoggingEmitter {
+	return &LoggingEmitter{
+		emit: !(modules.GetModules().Features().Cloud || cloud),
+	}
 }
 
 // LoggingEmitter logs all events with info level
-type LoggingEmitter struct{}
+type LoggingEmitter struct {
+	emit bool
+}
 
 // EmitAuditEvent logs audit event, skips session print events, session
 // disk events and app session request events, because they are very verbose.
-func (*LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+func (l *LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	if !l.emit {
+		return nil
+	}
+
 	switch event.GetType() {
 	case ResizeEvent, SessionDiskEvent, SessionPrintEvent, AppSessionRequestEvent, "":
 		return nil
@@ -268,14 +278,13 @@ func (*LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audit
 		return trace.Wrap(err)
 	}
 
-	var fields log.Fields
-	err = utils.FastUnmarshal(data, &fields)
-	if err != nil {
+	var fields map[string]any
+	if err := utils.FastUnmarshal(data, &fields); err != nil {
 		return trace.Wrap(err)
 	}
-	fields[trace.Component] = teleport.Component(teleport.ComponentAuditLog)
+	fields[teleport.ComponentKey] = teleport.ComponentAuditLog
 
-	log.WithFields(fields).Infof(event.GetType())
+	slog.InfoContext(ctx, "emitting audit event", "event_type", event.GetType(), "fields", fields)
 	return nil
 }
 
@@ -521,7 +530,7 @@ func (s *ReportingStream) Complete(ctx context.Context) error {
 		Error:     err,
 	}:
 	default:
-		log.Warningf("Skip send event on a blocked channel.")
+		slog.WarnContext(ctx, "Skip send event on a blocked channel.")
 	}
 	return trace.Wrap(err)
 }

@@ -518,6 +518,7 @@ EOF
 install_teleport_node_config() {
     log "Writing Teleport node service config to ${TELEPORT_CONFIG_PATH}"
     ${TELEPORT_BINARY_DIR}/teleport node configure \
+      --silent \
       --token ${JOIN_TOKEN} \
       ${JOIN_METHOD_FLAG} \
       --ca-pin ${CA_PINS} \
@@ -923,7 +924,10 @@ install_from_repo() {
         fi
         apt-get update
         apt-get install -y ${PACKAGE_LIST}
-    elif [ "$ID" = "amzn" ] || [ "$ID" = "rhel" ] || [ "$ID" = "centos" ]; then
+    elif [ "$ID" = "amzn" ] || [ "$ID" = "rhel" ] || [ "$ID" = "centos" ] || [ "$ID" = "rocky" ] || [ "$ID" = "almalinux" ]; then
+        if [ "$ID" = "rocky" ] || [ "$ID" = "almalinux" ]; then
+            ID="rhel" # Rocky and AlmaLinux are bug-for-bug compatible with rhel (including the VERSION_ID format).
+        fi
         if [ "$ID" = "rhel" ]; then
             VERSION_ID="${VERSION_ID//.*/}" # convert version numbers like '7.2' to only include the major version
         fi
@@ -990,7 +994,7 @@ is_repo_available() {
 
     # The following distros+version have a Teleport repository to install from.
     case "${ID}-${VERSION_ID}" in
-        ubuntu-16.04* | ubuntu-18.04* | ubuntu-20.04* | ubuntu-22.04* | \
+        ubuntu-16.04* | ubuntu-18.04* | ubuntu-20.04* | ubuntu-22.04* | ubuntu-24.04* |\
         debian-9* | debian-10* | debian-11* | debian-12* | \
         rhel-7* | rhel-8* | rhel-9* | \
         centos-7* | centos-8* | centos-9* | \

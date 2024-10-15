@@ -29,6 +29,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 )
@@ -77,15 +78,13 @@ func MakeTestClient(ctx context.Context, config common.TestClientConfig, opts ..
 	}
 
 	client := redis.NewClient(&redis.Options{
-		Addr:         config.Address,
-		TLSConfig:    tlsConfig,
-		DialTimeout:  clientOptions.timeout,
-		ReadTimeout:  clientOptions.timeout,
-		WriteTimeout: clientOptions.timeout,
-		// Set DisableAuthOnConnect to true to avoid automatically sending
-		// HELLO to the server to speed up the tests. Let the caller decide to
-		// send HELLO or not.
-		DisableAuthOnConnect: true,
+		Addr:             config.Address,
+		TLSConfig:        tlsConfig,
+		DialTimeout:      clientOptions.timeout,
+		ReadTimeout:      clientOptions.timeout,
+		WriteTimeout:     clientOptions.timeout,
+		Protocol:         protocolV2,
+		DisableIndentity: true,
 	})
 
 	if !clientOptions.skipPing {
@@ -128,8 +127,8 @@ func NewTestServer(t testing.TB, config common.TestServerConfig, opts ...TestSer
 		return nil, trace.Wrap(err)
 	}
 	log := logrus.WithFields(logrus.Fields{
-		trace.Component: defaults.ProtocolRedis,
-		"name":          config.Name,
+		teleport.ComponentKey: defaults.ProtocolRedis,
+		"name":                config.Name,
 	})
 	server := &TestServer{
 		cfg: config,

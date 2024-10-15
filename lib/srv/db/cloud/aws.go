@@ -29,6 +29,7 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud"
 	awslib "github.com/gravitational/teleport/lib/cloud/aws"
@@ -71,8 +72,8 @@ func newAWS(ctx context.Context, config awsConfig) (*awsClient, error) {
 	}
 
 	logger := logrus.WithFields(logrus.Fields{
-		trace.Component: "aws",
-		"db":            config.database.GetName(),
+		teleport.ComponentKey: "aws",
+		"db":                  config.database.GetName(),
 	})
 	dbConfigurator, err := getDBConfigurator(ctx, logger, config.clients, config.database)
 	if err != nil {
@@ -171,12 +172,12 @@ func (r *awsClient) ensureIAMPolicy(ctx context.Context) error {
 		return trace.Wrap(err)
 	}
 	var changed bool
-	dbIAM.ForEach(func(effect, action, resource string) {
-		if policy.Ensure(effect, action, resource) {
-			r.log.Debugf("Permission %q for %q is already part of policy.", action, resource)
-		} else {
+	dbIAM.ForEach(func(effect, action, resource string, conditions awslib.Conditions) {
+		if policy.EnsureResourceAction(effect, action, resource, conditions) {
 			r.log.Debugf("Adding permission %q for %q to policy.", action, resource)
 			changed = true
+		} else {
+			r.log.Debugf("Permission %q for %q is already part of policy.", action, resource)
 		}
 	})
 	if !changed {
@@ -205,11 +206,11 @@ func (r *awsClient) deleteIAMPolicy(ctx context.Context) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	dbIAM.ForEach(func(effect, action, resource string) {
-		policy.Delete(effect, action, resource)
+	dbIAM.ForEach(func(effect, action, resource string, conditions awslib.Conditions) {
+		policy.DeleteResourceAction(effect, action, resource, conditions)
 	})
 	// If policy is empty now, delete it as IAM policy can't be empty.
-	if len(policy.Statements) == 0 {
+	if policy.IsEmpty() {
 		return r.detachIAMPolicy(ctx)
 	}
 	return r.updateIAMPolicy(ctx, policy)

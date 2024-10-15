@@ -84,12 +84,12 @@ type UserACL struct {
 	Plugins ResourceAccess `json:"plugins"`
 	// Integrations defines whether the user has access to manage integrations.
 	Integrations ResourceAccess `json:"integrations"`
+	// UserTasks defines whether the user has access to manage UserTasks.
+	UserTasks ResourceAccess `json:"userTasks"`
 	// DeviceTrust defines access to device trust.
 	DeviceTrust ResourceAccess `json:"deviceTrust"`
 	// Locks defines access to locking resources.
 	Locks ResourceAccess `json:"lock"`
-	// Assist defines access to assist feature.
-	Assist ResourceAccess `json:"assist"`
 	// SAMLIdpServiceProvider defines access to `saml_idp_service_provider` objects.
 	SAMLIdpServiceProvider ResourceAccess `json:"samlIdpServiceProvider"`
 	// AccessList defines access to access list management.
@@ -106,13 +106,21 @@ type UserACL struct {
 	AccessGraph ResourceAccess `json:"accessGraph"`
 	// Bots defines access to manage Bots.
 	Bots ResourceAccess `json:"bots"`
+	// BotInstances defines access to manage bot instances
+	BotInstances ResourceAccess `json:"botInstances"`
+	// AccessMonitoringRule defines access to manage access monitoring rule resources.
+	AccessMonitoringRule ResourceAccess `json:"accessMonitoringRule"`
+	// CrownJewel defines access to manage CrownJewel resources.
+	CrownJewel ResourceAccess `json:"crownJewel"`
+	// AccessGraphSettings defines access to manage access graph settings.
+	AccessGraphSettings ResourceAccess `json:"accessGraphSettings"`
 }
 
 func hasAccess(roleSet RoleSet, ctx *Context, kind string, verbs ...string) bool {
 	for _, verb := range verbs {
 		// Since this check occurs often and does not imply the caller is trying to
 		// ResourceAccess any resource, silence any logging done on the proxy.
-		if err := roleSet.GuessIfAccessIsPossible(ctx, apidefaults.Namespace, kind, verb, true); err != nil {
+		if err := roleSet.GuessIfAccessIsPossible(ctx, apidefaults.Namespace, kind, verb); err != nil {
 			return false
 		}
 	}
@@ -134,7 +142,6 @@ func newAccess(roleSet RoleSet, ctx *Context, kind string) ResourceAccess {
 func NewUserACL(user types.User, userRoles RoleSet, features proto.Features, desktopRecordingEnabled, accessMonitoringEnabled bool) UserACL {
 	ctx := &Context{User: user}
 	recordedSessionAccess := newAccess(userRoles, ctx, types.KindSession)
-	activeSessionAccess := newAccess(userRoles, ctx, types.KindSSHSession)
 	roleAccess := newAccess(userRoles, ctx, types.KindRole)
 	authConnectors := newAccess(userRoles, ctx, types.KindAuthConnector)
 	trustedClusterAccess := newAccess(userRoles, ctx, types.KindTrustedCluster)
@@ -147,21 +154,27 @@ func NewUserACL(user types.User, userRoles RoleSet, features proto.Features, des
 	dbAccess := newAccess(userRoles, ctx, types.KindDatabase)
 	kubeServerAccess := newAccess(userRoles, ctx, types.KindKubeServer)
 	requestAccess := newAccess(userRoles, ctx, types.KindAccessRequest)
+	accessMonitoringRules := newAccess(userRoles, ctx, types.KindAccessMonitoringRule)
 	desktopAccess := newAccess(userRoles, ctx, types.KindWindowsDesktop)
 	cnDiagnosticAccess := newAccess(userRoles, ctx, types.KindConnectionDiagnostic)
 	samlIdpServiceProviderAccess := newAccess(userRoles, ctx, types.KindSAMLIdPServiceProvider)
 
-	var assistAccess ResourceAccess
-	if features.Assist {
-		assistAccess = newAccess(userRoles, ctx, types.KindAssistant)
+	// active sessions are a special case - if a user's role set has any join_sessions
+	// policies then the ACL must permit showing active sessions
+	activeSessionAccess := newAccess(userRoles, ctx, types.KindSSHSession)
+	if userRoles.CanJoinSessions() {
+		activeSessionAccess.List = true
+		activeSessionAccess.Read = true
 	}
 
-	// The billing dashboards are available in cloud clusters or for
-	// self-hosted dashboards for usage-based subscriptions.
+	// The billing dashboards are available in: cloud clusters &
+	// usage-based self-hosted non-stripe dashboards.
 	var billingAccess ResourceAccess
 	isDashboard := IsDashboard(features)
-	isUsageBasedEnterprise := features.GetProductType() == proto.ProductType_PRODUCT_TYPE_EUB
-	if features.Cloud || (isDashboard && isUsageBasedEnterprise) {
+	isUsageBased := features.IsUsageBased
+	isStripeManaged := features.IsStripeManaged
+
+	if features.Cloud || (isDashboard && isUsageBased && !isStripeManaged) {
 		billingAccess = newAccess(userRoles, ctx, types.KindBilling)
 	}
 
@@ -171,8 +184,10 @@ func NewUserACL(user types.User, userRoles RoleSet, features proto.Features, des
 	}
 
 	var accessGraphAccess ResourceAccess
+	var accessGraphSettings ResourceAccess
 	if features.AccessGraph {
 		accessGraphAccess = newAccess(userRoles, ctx, types.KindAccessGraph)
+		accessGraphSettings = newAccess(userRoles, ctx, types.KindAccessGraphSettings)
 	}
 
 	clipboard := userRoles.DesktopClipboard()
@@ -187,6 +202,9 @@ func NewUserACL(user types.User, userRoles RoleSet, features proto.Features, des
 	accessListAccess := newAccess(userRoles, ctx, types.KindAccessList)
 	externalAuditStorage := newAccess(userRoles, ctx, types.KindExternalAuditStorage)
 	bots := newAccess(userRoles, ctx, types.KindBot)
+	botInstances := newAccess(userRoles, ctx, types.KindBotInstance)
+	crownJewelAccess := newAccess(userRoles, ctx, types.KindCrownJewel)
+	userTasksAccess := newAccess(userRoles, ctx, types.KindUserTask)
 
 	var auditQuery ResourceAccess
 	var securityReports ResourceAccess
@@ -220,10 +238,10 @@ func NewUserACL(user types.User, userRoles RoleSet, features proto.Features, des
 		License:                 license,
 		Plugins:                 pluginsAccess,
 		Integrations:            integrationsAccess,
+		UserTasks:               userTasksAccess,
 		DiscoveryConfig:         discoveryConfigsAccess,
 		DeviceTrust:             deviceTrust,
 		Locks:                   lockAccess,
-		Assist:                  assistAccess,
 		SAMLIdpServiceProvider:  samlIdpServiceProviderAccess,
 		AccessList:              accessListAccess,
 		AuditQuery:              auditQuery,
@@ -231,5 +249,9 @@ func NewUserACL(user types.User, userRoles RoleSet, features proto.Features, des
 		ExternalAuditStorage:    externalAuditStorage,
 		AccessGraph:             accessGraphAccess,
 		Bots:                    bots,
+		BotInstances:            botInstances,
+		AccessMonitoringRule:    accessMonitoringRules,
+		CrownJewel:              crownJewelAccess,
+		AccessGraphSettings:     accessGraphSettings,
 	}
 }

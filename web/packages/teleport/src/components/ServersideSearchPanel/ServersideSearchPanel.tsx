@@ -17,85 +17,42 @@
  */
 
 import React from 'react';
-import { PageIndicatorText } from 'shared/components/Search';
-import { Box, Flex } from 'design';
-import { StyledPanel } from 'design/DataTable';
-import InputSearch from 'design/DataTable/InputSearch';
+import { Flex } from 'design';
 
 import { AdvancedSearchToggle } from 'shared/components/AdvancedSearchToggle';
-
-import { PageIndicators } from 'teleport/components/hooks/useServersidePagination';
 
 import useServersideSearchPanel, {
   SearchPanelState,
   HookProps,
-} from './useServerSideSearchPanel';
+} from 'teleport/components/ServersideSearchPanel/useServerSideSearchPanel';
 
-interface ComponentProps {
-  pageIndicators: PageIndicators;
-  disabled?: boolean;
+import { SearchInput } from './SearchInput';
+
+export function ServersideSearchPanel(props: HookProps) {
+  const state = useServersideSearchPanel(props);
+  return <SearchPanel {...state} />;
 }
 
-export interface Props extends HookProps, ComponentProps {}
-
-export default function Container(props: Props) {
-  const { pageIndicators, disabled, ...hookProps } = props;
-  const state = useServersideSearchPanel(hookProps);
-  return (
-    <ServersideSearchPanel
-      {...state}
-      pageIndicators={pageIndicators}
-      disabled={disabled}
-    />
-  );
-}
-
-interface State extends SearchPanelState, ComponentProps {}
-
-export function ServersideSearchPanel({
+export function SearchPanel({
   searchString,
   setSearchString,
   isAdvancedSearch,
   setIsAdvancedSearch,
   onSubmitSearch,
-  pageIndicators,
-  disabled = false,
-}: State) {
+}: SearchPanelState) {
   function onToggle() {
-    setIsAdvancedSearch(!isAdvancedSearch);
+    setIsAdvancedSearch(wasAdvancedSearch => !wasAdvancedSearch);
   }
 
   return (
-    <StyledPanel
-      as="form"
-      onSubmit={onSubmitSearch}
-      borderTopLeftRadius={3}
-      borderTopRightRadius={3}
-      style={disabled ? { pointerEvents: 'none', opacity: '0.5' } : {}}
-    >
-      <Flex justifyContent="space-between" alignItems="center" width="100%">
-        <Flex style={{ width: '70%' }} alignItems="center">
-          <Box width="100%" mr={3}>
-            <InputSearch
-              searchValue={searchString}
-              setSearchValue={setSearchString}
-            >
-              <AdvancedSearchToggle
-                isToggled={isAdvancedSearch}
-                onToggle={onToggle}
-                px={4}
-              />
-            </InputSearch>
-          </Box>
-        </Flex>
-        <Flex>
-          <PageIndicatorText
-            from={pageIndicators.from}
-            to={pageIndicators.to}
-            count={pageIndicators.totalCount}
-          />
-        </Flex>
-      </Flex>
-    </StyledPanel>
+    <Flex as="form" className="SearchPanel" onSubmit={onSubmitSearch}>
+      <SearchInput searchValue={searchString} setSearchValue={setSearchString}>
+        <AdvancedSearchToggle
+          isToggled={isAdvancedSearch}
+          onToggle={onToggle}
+          px={4}
+        />
+      </SearchInput>
+    </Flex>
   );
 }

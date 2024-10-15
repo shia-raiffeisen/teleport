@@ -21,7 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 
@@ -58,16 +57,32 @@ const (
 	// the certificate authority that will be used by the OIDC Identity Provider.
 	// Similar to JWTSigner, it doesn't issue Certificates but signs JSON Web Tokens.
 	OIDCIdPCA CertAuthType = "oidc_idp"
+	// SPIFFECA identifies the certificate authority that will be used by the
+	// SPIFFE Workload Identity provider functionality.
+	SPIFFECA CertAuthType = "spiffe"
+	// OktaCA identifies the certificate authority that will be used by the
+	// integration with Okta.
+	OktaCA CertAuthType = "okta"
 )
 
 // CertAuthTypes lists all certificate authority types.
-var CertAuthTypes = []CertAuthType{HostCA, UserCA, DatabaseCA, DatabaseClientCA, OpenSSHCA, JWTSigner, SAMLIDPCA, OIDCIdPCA}
+var CertAuthTypes = []CertAuthType{HostCA,
+	UserCA,
+	DatabaseCA,
+	DatabaseClientCA,
+	OpenSSHCA,
+	JWTSigner,
+	SAMLIDPCA,
+	OIDCIdPCA,
+	SPIFFECA,
+	OktaCA,
+}
 
 // NewlyAdded should return true for CA types that were added in the current
 // major version, so that we can avoid erroring out when a potentially older
 // remote server doesn't know about them.
 func (c CertAuthType) NewlyAdded() bool {
-	return c.addedInMajorVer() >= semver.New(api.Version).Major
+	return c.addedInMajorVer() >= api.SemVersion.Major
 }
 
 // addedInVer return the major version in which given CA was added.
@@ -79,6 +94,10 @@ func (c CertAuthType) addedInMajorVer() int64 {
 		return 12
 	case DatabaseClientCA:
 		return 15
+	case SPIFFECA:
+		return 15
+	case OktaCA:
+		return 16
 	default:
 		// We don't care about other CAs added before v4.0.0
 		return 4

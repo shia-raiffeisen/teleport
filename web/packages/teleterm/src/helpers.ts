@@ -24,7 +24,7 @@ import { Database } from 'gen-proto-ts/teleport/lib/teleterm/v1/database_pb';
 import { App } from 'gen-proto-ts/teleport/lib/teleterm/v1/app_pb';
 import { Kube } from 'gen-proto-ts/teleport/lib/teleterm/v1/kube_pb';
 
-import * as prehog from 'gen-proto-ts/prehog/v1alpha/connect_pb';
+import * as api from 'gen-proto-ts/teleport/lib/teleterm/v1/tshd_events_service_pb';
 
 import {
   PtyClientEvent,
@@ -35,6 +35,10 @@ import {
   PtyEventStartError,
   PtyServerEvent,
 } from 'teleterm/sharedProcess/api/protogen/ptyHostService_pb';
+import {
+  ReloginRequest,
+  SendNotificationRequest,
+} from 'teleterm/services/tshdEvents';
 
 export function resourceOneOfIsServer(
   resource: PaginatedResource['resource']
@@ -107,6 +111,7 @@ export function ptyEventOneOfIsExit(
 } {
   return event.oneofKind === 'exit';
 }
+
 export function ptyEventOneOfIsStartError(
   event: PtyClientEvent['event'] | PtyServerEvent['event']
 ): event is {
@@ -116,83 +121,38 @@ export function ptyEventOneOfIsStartError(
   return event.oneofKind === 'startError';
 }
 
-export function connectEventOneOfIsClusterLogin(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'clusterLogin';
-  clusterLogin: prehog.ConnectClusterLoginEvent;
+export function notificationRequestOneOfIsCannotProxyGatewayConnection(
+  subject: SendNotificationRequest['subject']
+): subject is {
+  oneofKind: 'cannotProxyGatewayConnection';
+  cannotProxyGatewayConnection: api.CannotProxyGatewayConnection;
 } {
-  return event.oneofKind === 'clusterLogin';
+  return subject.oneofKind === 'cannotProxyGatewayConnection';
 }
 
-export function connectEventOneOfIsProtocolUse(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'protocolUse';
-  protocolUse: prehog.ConnectProtocolUseEvent;
+export function notificationRequestOneOfIsCannotProxyVnetConnection(
+  subject: SendNotificationRequest['subject']
+): subject is {
+  oneofKind: 'cannotProxyVnetConnection';
+  cannotProxyVnetConnection: api.CannotProxyVnetConnection;
 } {
-  return event.oneofKind === 'protocolUse';
+  return subject.oneofKind === 'cannotProxyVnetConnection';
 }
 
-export function connectEventOneOfIsAccessRequestCreate(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'accessRequestCreate';
-  accessRequestCreate: prehog.ConnectAccessRequestCreateEvent;
+export function reloginReasonOneOfIsGatewayCertExpired(
+  reason: ReloginRequest['reason']
+): reason is {
+  oneofKind: 'gatewayCertExpired';
+  gatewayCertExpired: api.GatewayCertExpired;
 } {
-  return event.oneofKind === 'accessRequestCreate';
+  return reason.oneofKind === 'gatewayCertExpired';
 }
 
-export function connectEventOneOfIsAccessRequestReview(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'accessRequestReview';
-  accessRequestReview: prehog.ConnectAccessRequestReviewEvent;
+export function reloginReasonOneOfIsVnetCertExpired(
+  reason: ReloginRequest['reason']
+): reason is {
+  oneofKind: 'vnetCertExpired';
+  vnetCertExpired: api.VnetCertExpired;
 } {
-  return event.oneofKind === 'accessRequestReview';
-}
-
-export function connectEventOneOfIsAccessRequestAssumeRole(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'accessRequestAssumeRole';
-  accessRequestAssumeRole: prehog.ConnectAccessRequestAssumeRoleEvent;
-} {
-  return event.oneofKind === 'accessRequestAssumeRole';
-}
-
-export function connectEventOneOfIsFileTransferRun(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'fileTransferRun';
-  fileTransferRun: prehog.ConnectFileTransferRunEvent;
-} {
-  return event.oneofKind === 'fileTransferRun';
-}
-
-export function connectEventOneOfIsUserJobRoleUpdate(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'userJobRoleUpdate';
-  userJobRoleUpdate: prehog.ConnectUserJobRoleUpdateEvent;
-} {
-  return event.oneofKind === 'userJobRoleUpdate';
-}
-
-export function connectEventOneOfIsConnectMyComputerSetup(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'connectMyComputerSetup';
-  connectMyComputerSetup: prehog.ConnectConnectMyComputerSetup;
-} {
-  return event.oneofKind === 'connectMyComputerSetup';
-}
-
-export function connectEventOneOfIsConnectMyComputerAgentStart(
-  event: prehog.SubmitConnectEventRequest['event']
-): event is {
-  oneofKind: 'connectMyComputerAgentStart';
-  connectMyComputerAgentStart: prehog.ConnectConnectMyComputerAgentStart;
-} {
-  return event.oneofKind === 'connectMyComputerAgentStart';
+  return reason.oneofKind === 'vnetCertExpired';
 }

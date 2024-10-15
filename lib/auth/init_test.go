@@ -22,17 +22,20 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
@@ -42,10 +45,15 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/auth/keystore"
+	"github.com/gravitational/teleport/lib/auth/state"
+	"github.com/gravitational/teleport/lib/auth/storage"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/observability/tracing"
 	"github.com/gravitational/teleport/lib/services"
@@ -76,10 +84,10 @@ func TestReadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	id, err := ReadSSHIdentityFromKeyPair(priv, cert)
+	id, err := state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.NoError(t, err)
 	require.Equal(t, "example.com", id.ClusterName)
-	require.Equal(t, IdentityID{HostUUID: "id1.example.com", Role: types.RoleNode}, id.ID)
+	require.Equal(t, state.IdentityID{HostUUID: "id1.example.com", Role: types.RoleNode}, id.ID)
 	require.Equal(t, cert, id.CertBytes)
 	require.Equal(t, priv, id.KeyBytes)
 
@@ -109,7 +117,7 @@ func TestBadIdentity(t *testing.T) {
 	require.NoError(t, err)
 
 	// bad cert type
-	_, err = ReadSSHIdentityFromKeyPair(priv, pub)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, pub)
 	require.IsType(t, trace.BadParameter(""), err)
 
 	// missing authority domain
@@ -124,7 +132,7 @@ func TestBadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ReadSSHIdentityFromKeyPair(priv, cert)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.IsType(t, trace.BadParameter(""), err)
 
 	// missing host uuid
@@ -139,7 +147,7 @@ func TestBadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ReadSSHIdentityFromKeyPair(priv, cert)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.IsType(t, trace.BadParameter(""), err)
 
 	// unrecognized role
@@ -154,8 +162,217 @@ func TestBadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ReadSSHIdentityFromKeyPair(priv, cert)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.IsType(t, trace.BadParameter(""), err)
+}
+
+func TestSignatureAlgorithmSuite(t *testing.T) {
+	ctx := context.Background()
+
+	modules.SetTestModules(t, &modules.TestModules{
+		TestFeatures: modules.Features{
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.HSM: {Enabled: true},
+			},
+		},
+	})
+
+	setupInitConfig := func(t *testing.T, fips, hsm bool) InitConfig {
+		cfg := setupConfig(t)
+		cfg.FIPS = fips
+		if hsm {
+			cfg.KeyStoreConfig = keystore.HSMTestConfig(t)
+		}
+		// Pre-generate all CAs to keep tests fast esp. with SoftHSM.
+		for _, caType := range types.CertAuthTypes {
+			cfg.BootstrapResources = append(cfg.BootstrapResources, suite.NewTestCAWithConfig(suite.TestCAConfig{
+				Type:        caType,
+				ClusterName: cfg.ClusterName.GetClusterName(),
+				Clock:       cfg.Clock,
+			}))
+		}
+		return cfg
+	}
+
+	testCases := map[string]struct {
+		fips                  bool
+		hsm                   bool
+		cloud                 bool
+		expectDefaultSuite    types.SignatureAlgorithmSuite
+		expectUnallowedSuites []types.SignatureAlgorithmSuite
+	}{
+		"basic": {
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+		},
+		"fips": {
+			fips:               true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_FIPS_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			},
+		},
+		"hsm": {
+			hsm:                true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+			},
+		},
+		"fips and hsm": {
+			fips:               true,
+			hsm:                true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_FIPS_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			},
+		},
+		"cloud": {
+			cloud:              true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+			},
+		},
+	}
+
+	// Test the behavior of auth server init. A default signature algorithm
+	// suite should never overwrite a persisted signature algorithm suite for an
+	// existing cluster, even if that was also a default.
+	t.Run("init", func(t *testing.T) {
+		for desc, tc := range testCases {
+			t.Run(desc, func(t *testing.T) {
+				if tc.cloud {
+					modules.SetTestModules(t, &modules.TestModules{
+						TestFeatures: modules.Features{
+							Cloud: true,
+							Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+								entitlements.HSM: {Enabled: true},
+							},
+						},
+					})
+				}
+				// Assert that a fresh cluster gets expected default suite.
+				cfg := setupInitConfig(t, tc.fips, tc.hsm)
+				authServer, err := Init(ctx, cfg)
+				require.NoError(t, err)
+				t.Cleanup(func() { authServer.Close() })
+				authPref, err := authServer.GetAuthPreference(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, types.OriginDefaults, authPref.GetMetadata().Labels[types.OriginLabel])
+				assert.Equal(t, tc.expectDefaultSuite, authPref.GetSignatureAlgorithmSuite())
+
+				// Reset to unspecified suite and persist (still with
+				// OriginDefaults) to mimic an older cluster with the old defaults
+				// that later gets upgraded.
+				authPref.SetSignatureAlgorithmSuite(types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED)
+				_, err = authServer.UpsertAuthPreference(ctx, authPref)
+				require.NoError(t, err)
+				authPref, err = authServer.GetAuthPreference(ctx)
+				require.NoError(t, err)
+				// Sanity check it persisted as a default.
+				assert.Equal(t, types.OriginDefaults, authPref.GetMetadata().Labels[types.OriginLabel])
+				assert.Equal(t, types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED, authPref.GetSignatureAlgorithmSuite())
+
+				// Start a second brand new auth server sharing the same config and
+				// backend. The new auth starting up would apply the new default
+				// auth preference and persist it to the backend, but it should not
+				// modify the existing signature algorithm suite even though it's
+				// unspecified. This is meant to test that a v16 auth server
+				// upgraded to v17 will still have an unspecified signature
+				// algorithm suite and won't get a new one until explicitly opting
+				// in.
+				authServer, err = Init(ctx, cfg)
+				require.NoError(t, err)
+				t.Cleanup(func() { authServer.Close() })
+				authPref, err = authServer.GetAuthPreference(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, types.OriginDefaults, authPref.GetMetadata().Labels[types.OriginLabel])
+				assert.Equal(t, types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED, authPref.GetSignatureAlgorithmSuite())
+
+				// Assert that the selected algorithm is RSA2048 when the suite is
+				// unspecified.
+				alg, err := cryptosuites.AlgorithmForKey(ctx,
+					cryptosuites.GetCurrentSuiteFromAuthPreference(authServer),
+					cryptosuites.UserTLS)
+				require.NoError(t, err)
+				require.Equal(t, cryptosuites.RSA2048, alg)
+			})
+		}
+	})
+
+	suiteName := func(suite types.SignatureAlgorithmSuite) string {
+		suiteName, err := suite.MarshalText()
+		require.NoError(t, err)
+		return string(suiteName)
+	}
+
+	// Test that the auth preference cannot be upserted with a signature
+	// algorithm suite incompatible with the cluster FIPS and HSM settings.
+	t.Run("upsert", func(t *testing.T) {
+		for desc, tc := range testCases {
+			t.Run(desc, func(t *testing.T) {
+				if tc.cloud {
+					modules.SetTestModules(t, &modules.TestModules{
+						TestFeatures: modules.Features{
+							Cloud: true,
+							Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+								entitlements.HSM: {Enabled: true},
+							},
+						},
+					})
+				}
+				cfg := TestAuthServerConfig{
+					Dir:  t.TempDir(),
+					FIPS: tc.fips,
+					AuthPreferenceSpec: &types.AuthPreferenceSpecV2{
+						// Cloud requires second factor enabled.
+						SecondFactor: constants.SecondFactorOn,
+						Webauthn: &types.Webauthn{
+							RPID: "teleport.example.com",
+						},
+					},
+				}
+				if tc.hsm {
+					cfg.KeystoreConfig = keystore.HSMTestConfig(t)
+				}
+				testAuthServer, err := NewTestAuthServer(cfg)
+				require.NoError(t, err)
+				tlsServer, err := testAuthServer.NewTestTLSServer()
+				require.NoError(t, err)
+				clt, err := tlsServer.NewClient(TestAdmin())
+				require.NoError(t, err)
+
+				for _, suiteValue := range types.SignatureAlgorithmSuite_value {
+					suite := types.SignatureAlgorithmSuite(suiteValue)
+					t.Run(suiteName(suite), func(t *testing.T) {
+						authPref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+							SignatureAlgorithmSuite: suite,
+						})
+						require.NoError(t, err)
+
+						_, err = clt.UpsertAuthPreference(ctx, authPref)
+						if slices.Contains(tc.expectUnallowedSuites, suite) {
+							var badParameterErr *trace.BadParameterError
+							assert.ErrorAs(t, err, &badParameterErr)
+							return
+						} else {
+							assert.NoError(t, err)
+						}
+
+						// Reset should go back to the default suite.
+						err = clt.ResetAuthPreference(ctx)
+						require.NoError(t, err)
+						authPref, err = clt.GetAuthPreference(ctx)
+						require.NoError(t, err)
+						assert.Equal(t, types.OriginDefaults, authPref.GetMetadata().Labels[types.OriginLabel])
+						assert.Equal(t, tc.expectDefaultSuite, authPref.GetSignatureAlgorithmSuite())
+					})
+				}
+			})
+		}
+	})
 }
 
 type testDynamicallyConfigurableParams struct {
@@ -307,7 +524,7 @@ func TestAuthPreference(t *testing.T) {
 				SecondFactor: constants.SecondFactorOff,
 			})
 			require.NoError(t, err)
-			err = authServer.SetAuthPreference(ctx, dynamically)
+			_, err = authServer.UpsertAuthPreference(ctx, dynamically)
 			require.NoError(t, err)
 		},
 		getStored: func(t *testing.T, authServer *Server) types.ResourceWithOrigin {
@@ -315,6 +532,36 @@ func TestAuthPreference(t *testing.T) {
 			require.NoError(t, err)
 			return authPref
 		},
+	})
+}
+
+func TestAuthPreferenceSecondFactorOnly(t *testing.T) {
+	modules.SetInsecureTestMode(false)
+	defer modules.SetInsecureTestMode(true)
+	ctx := context.Background()
+
+	t.Run("starting with second_factor disabled fails", func(t *testing.T) {
+		conf := setupConfig(t)
+		authPref, err := types.NewAuthPreferenceFromConfigFile(types.AuthPreferenceSpecV2{
+			SecondFactor: constants.SecondFactorOff,
+		})
+		require.NoError(t, err)
+
+		conf.AuthPreference = authPref
+		_, err = Init(ctx, conf)
+		require.Error(t, err)
+	})
+
+	t.Run("starting with defaults and dynamically updating to disable second factor fails", func(t *testing.T) {
+		conf := setupConfig(t)
+		s, err := Init(ctx, conf)
+		require.NoError(t, err)
+		authpref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+			SecondFactor: constants.SecondFactorOff,
+		})
+		require.NoError(t, err)
+		_, err = s.UpsertAuthPreference(ctx, authpref)
+		require.Error(t, err)
 	})
 }
 
@@ -350,7 +597,7 @@ func TestClusterNetworkingConfig(t *testing.T) {
 			})
 			require.NoError(t, err)
 			dynamically.SetOrigin(types.OriginDynamic)
-			err = authServer.SetClusterNetworkingConfig(ctx, dynamically)
+			_, err = authServer.UpsertClusterNetworkingConfig(ctx, dynamically)
 			require.NoError(t, err)
 		},
 		getStored: func(t *testing.T, authServer *Server) types.ResourceWithOrigin {
@@ -392,7 +639,7 @@ func TestSessionRecordingConfig(t *testing.T) {
 			})
 			require.NoError(t, err)
 			dynamically.SetOrigin(types.OriginDynamic)
-			err = authServer.SetSessionRecordingConfig(ctx, dynamically)
+			_, err = authServer.UpsertSessionRecordingConfig(ctx, dynamically)
 			require.NoError(t, err)
 		},
 		getStored: func(t *testing.T, authServer *Server) types.ResourceWithOrigin {
@@ -464,6 +711,7 @@ func TestPresets(t *testing.T) {
 		teleport.PresetEditorRoleName,
 		teleport.PresetAccessRoleName,
 		teleport.PresetAuditorRoleName,
+		teleport.PresetTerraformProviderRoleName,
 	}
 
 	t.Run("EmptyCluster", func(t *testing.T) {
@@ -650,7 +898,7 @@ func TestPresets(t *testing.T) {
 				defer mu.Unlock()
 				require.Contains(t, expectedPresetRoles, r.GetName())
 				require.NotContains(t, createdPresets, r.GetName())
-				require.False(t, types.IsSystemResource(r))
+				require.False(t, types.IsSystemResource(r) && r.GetName() != teleport.SystemOktaRequesterRoleName)
 				createdPresets[r.GetName()] = r
 			}).
 			Return(func(_ context.Context, r types.Role) (types.Role, error) {
@@ -793,10 +1041,12 @@ func TestPresets(t *testing.T) {
 			teleport.PresetDeviceAdminRoleName,
 			teleport.PresetDeviceEnrollRoleName,
 			teleport.PresetRequireTrustedDeviceRoleName,
+			teleport.SystemOktaRequesterRoleName, // This is treated as a preset
 		}, presetRoleNames...)
 
 		enterpriseSystemRoleNames := []string{
 			teleport.SystemAutomaticAccessApprovalRoleName,
+			teleport.SystemOktaAccessRoleName,
 		}
 
 		enterpriseUsers := []types.User{
@@ -868,6 +1118,22 @@ func TestPresets(t *testing.T) {
 			require.Contains(t, upsertedUsers, sysUser.Metadata.Name)
 		})
 	})
+}
+
+func TestGetPresetUsers(t *testing.T) {
+	// no preset users for OSS
+	modules.SetTestModules(t, &modules.TestModules{
+		TestBuildType: modules.BuildOSS,
+	})
+	require.Empty(t, getPresetUsers())
+
+	// preset user @teleport-access-approval-bot on enterprise
+	modules.SetTestModules(t, &modules.TestModules{
+		TestBuildType: modules.BuildEnterprise,
+	})
+	require.Equal(t, []types.User{
+		services.NewSystemAutomaticAccessBotUser(),
+	}, getPresetUsers())
 }
 
 type mockUserManager struct {
@@ -977,16 +1243,28 @@ func setupConfig(t *testing.T) InitConfig {
 	bk, err := lite.New(context.TODO(), backend.Params{"path": tempDir})
 	require.NoError(t, err)
 
+	processStorage, err := storage.NewProcessStorage(
+		context.Background(),
+		filepath.Join(tempDir, teleport.ComponentProcess),
+	)
+	require.NoError(t, err)
+
 	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: "me.localhost",
 	})
 	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		bk.Close()
+		processStorage.Close()
+	})
 
 	return InitConfig{
 		DataDir:                 tempDir,
 		HostUUID:                "00000000-0000-0000-0000-000000000000",
 		NodeName:                "foo",
 		Backend:                 bk,
+		VersionStorage:          processStorage,
 		Authority:               testauthority.New(),
 		ClusterAuditConfig:      types.DefaultClusterAuditConfig(),
 		ClusterNetworkingConfig: types.DefaultClusterNetworkingConfig(),
@@ -995,12 +1273,7 @@ func setupConfig(t *testing.T) InitConfig {
 		StaticTokens:            types.DefaultStaticTokens(),
 		AuthPreference:          types.DefaultAuthPreference(),
 		SkipPeriodicOperations:  true,
-		KeyStoreConfig: keystore.Config{
-			Software: keystore.SoftwareConfig{
-				RSAKeyPairSource: testauthority.New().GenerateKeyPair,
-			},
-		},
-		Tracer: tracing.NoopTracer(teleport.ComponentAuth),
+		Tracer:                  tracing.NoopTracer(teleport.ComponentAuth),
 	}
 }
 
@@ -1491,7 +1764,7 @@ func resourceFromYAML(t *testing.T, value string) types.Resource {
 
 func resourceDiff(res1, res2 types.Resource) string {
 	return cmp.Diff(res1, res2,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision", "Namespace"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision", "Namespace"),
 		cmpopts.EquateEmpty())
 }
 
@@ -1700,7 +1973,7 @@ func TestIdentityChecker(t *testing.T) {
 				"test",
 				utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 				handler,
-				[]ssh.Signer{test.cert},
+				sshutils.StaticHostSigners(test.cert),
 				sshutils.AuthMethods{NoClient: true},
 				sshutils.SetInsecureSkipHostValidation(),
 			)
@@ -1708,7 +1981,7 @@ func TestIdentityChecker(t *testing.T) {
 			t.Cleanup(func() { sshServer.Close() })
 			require.NoError(t, sshServer.Start())
 
-			identity, err := GenerateIdentity(authServer, IdentityID{
+			identity, err := GenerateIdentity(authServer, state.IdentityID{
 				Role:     types.RoleNode,
 				HostUUID: uuid.New().String(),
 				NodeName: "node-1",
@@ -1747,25 +2020,81 @@ func TestInitCreatesCertsIfMissing(t *testing.T) {
 	}
 }
 
-func TestMigrateDatabaseClientCA(t *testing.T) {
-	ctx := context.Background()
-	conf := setupConfig(t)
+func TestTeleportProcessAuthVersionUpgradeCheck(t *testing.T) {
+	lib.SetInsecureDevMode(true)
+	defer lib.SetInsecureDevMode(false)
 
-	hostCA := suite.NewTestCA(types.HostCA, "me.localhost")
-	userCA := suite.NewTestCA(types.UserCA, "me.localhost")
-	dbServerCA := suite.NewTestCA(types.DatabaseCA, "me.localhost")
+	tests := []struct {
+		name            string
+		initialVersion  string
+		expectedVersion string
+		expectError     bool
+		skipCheck       bool
+	}{
+		{
+			name:            "first-launch",
+			initialVersion:  "",
+			expectedVersion: teleport.Version,
+			expectError:     false,
+		},
+		{
+			name:            "old-version-upgrade",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-1),
+			expectedVersion: teleport.Version,
+			expectError:     false,
+		},
+		{
+			name:            "major-upgrade-fail",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectError:     true,
+		},
+		{
+			name:            "major-upgrade-with-dev-skip-check",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectError:     false,
+			skipCheck:       true,
+		},
+		{
+			name:            "major-downgrade-fail",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectError:     true,
+		},
+		{
+			name:            "major-downgrade-with-dev-skip-check",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectError:     false,
+			skipCheck:       true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	conf.Authorities = []types.CertAuthority{hostCA, userCA, dbServerCA}
-	auth, err := Init(ctx, conf)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		err = auth.Close()
-		require.NoError(t, err)
-	})
+			authCfg := setupConfig(t)
 
-	dbClientCAs, err := auth.GetCertAuthorities(ctx, types.DatabaseClientCA, true)
-	require.NoError(t, err)
-	require.Len(t, dbClientCAs, 1)
-	require.Equal(t, dbServerCA.Spec.ActiveKeys.TLS[0].Cert, dbClientCAs[0].GetActiveKeys().TLS[0].Cert)
-	require.Equal(t, dbServerCA.Spec.ActiveKeys.TLS[0].Key, dbClientCAs[0].GetActiveKeys().TLS[0].Key)
+			if test.initialVersion != "" {
+				err := authCfg.VersionStorage.WriteTeleportVersion(ctx, semver.New(test.initialVersion))
+				require.NoError(t, err)
+			}
+			if test.skipCheck {
+				t.Setenv(skipVersionUpgradeCheckEnv, "yes")
+			}
+
+			_, err := Init(ctx, authCfg)
+			if test.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			lastKnownVersion, err := authCfg.VersionStorage.GetTeleportVersion(ctx)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedVersion, lastKnownVersion.String())
+		})
+	}
 }

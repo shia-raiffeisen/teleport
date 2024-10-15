@@ -20,12 +20,10 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -67,17 +65,17 @@ type Backend interface {
 	Update(ctx context.Context, i Item) (*Lease, error)
 
 	// Get returns a single item or not found error
-	Get(ctx context.Context, key []byte) (*Item, error)
+	Get(ctx context.Context, key Key) (*Item, error)
 
 	// GetRange returns query range
-	GetRange(ctx context.Context, startKey []byte, endKey []byte, limit int) (*GetResult, error)
+	GetRange(ctx context.Context, startKey, endKey Key, limit int) (*GetResult, error)
 
 	// Delete deletes item by key, returns NotFound error
 	// if item does not exist
-	Delete(ctx context.Context, key []byte) error
+	Delete(ctx context.Context, key Key) error
 
 	// DeleteRange deletes range of items with keys between startKey and endKey
-	DeleteRange(ctx context.Context, startKey, endKey []byte) error
+	DeleteRange(ctx context.Context, startKey, endKey Key) error
 
 	// KeepAlive keeps object from expiring, updates lease on the existing object,
 	// expires contains the new expiry to set on the lease,
@@ -90,7 +88,15 @@ type Backend interface {
 	ConditionalUpdate(ctx context.Context, i Item) (*Lease, error)
 
 	// ConditionalDelete deletes the item by key if the revision matches the stored revision.
-	ConditionalDelete(ctx context.Context, key []byte, revision string) error
+	ConditionalDelete(ctx context.Context, key Key, revision string) error
+
+	// AtomicWrite executes a batch of conditional actions atomically s.t. all actions happen if all
+	// conditions are met, but no actions happen if any condition fails to hold. If one or more conditions
+	// failed to hold, [ErrConditionFailed] is returned. The number of conditional actions must not
+	// exceed [MaxAtomicWriteSize] and no two conditional actions may point to the same key. If successful,
+	// the returned revision is the new revision associated with all [Put] actions that were part of the
+	// operation (the revision value has no meaning outside of the context of puts).
+	AtomicWrite(ctx context.Context, condacts []ConditionalAction) (revision string, err error)
 
 	// NewWatcher returns a new event watcher
 	NewWatcher(ctx context.Context, watch Watch) (Watcher, error)
@@ -122,20 +128,29 @@ func New(ctx context.Context, backend string, params Params) (Backend, error) {
 }
 
 // IterateRange is a helper for stepping over a range
-func IterateRange(ctx context.Context, bk Backend, startKey []byte, endKey []byte, limit int, fn func([]Item) (stop bool, err error)) error {
+func IterateRange(ctx context.Context, bk Backend, startKey, endKey Key, limit int, fn func([]Item) (stop bool, err error)) error {
+	if limit == 0 || limit > 10_000 {
+		limit = 10_000
+	}
 	for {
-		rslt, err := bk.GetRange(ctx, startKey, endKey, limit)
+		// we load an extra item here so that we can be certain we have a correct
+		// start key for the next range.
+		rslt, err := bk.GetRange(ctx, startKey, endKey, limit+1)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		stop, err := fn(rslt.Items)
+		end := limit
+		if len(rslt.Items) < end {
+			end = len(rslt.Items)
+		}
+		stop, err := fn(rslt.Items[0:end])
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		if stop || len(rslt.Items) < limit {
+		if stop || len(rslt.Items) <= limit {
 			return nil
 		}
-		startKey = nextKey(rslt.Items[limit-1].Key)
+		startKey = rslt.Items[limit].Key
 	}
 }
 
@@ -150,9 +165,9 @@ func IterateRange(ctx context.Context, bk Backend, startKey []byte, endKey []byt
 //
 // 2. allow individual backends to expose custom streaming methods s.t. the most performant
 // impl for a given backend may be used.
-func StreamRange(ctx context.Context, bk Backend, startKey, endKey []byte, pageSize int) stream.Stream[Item] {
+func StreamRange(ctx context.Context, bk Backend, startKey, endKey Key, pageSize int) stream.Stream[Item] {
 	return stream.PageFunc[Item](func() ([]Item, error) {
-		if startKey == nil {
+		if startKey.components == nil {
 			return nil, io.EOF
 		}
 		rslt, err := bk.GetRange(ctx, startKey, endKey, pageSize)
@@ -160,7 +175,7 @@ func StreamRange(ctx context.Context, bk Backend, startKey, endKey []byte, pageS
 			return nil, trace.Wrap(err)
 		}
 		if len(rslt.Items) < pageSize {
-			startKey = nil
+			startKey = Key{}
 		} else {
 			startKey = nextKey(rslt.Items[pageSize-1].Key)
 		}
@@ -179,10 +194,7 @@ func StreamRange(ctx context.Context, bk Backend, startKey, endKey []byte, pageS
 //	err = backend.KeepAlive(ctx, lease, expires)
 type Lease struct {
 	// Key is the resource identifier.
-	Key []byte
-	// ID is a lease ID, could be empty.
-	// Deprecated: use Revision instead
-	ID int64
+	Key Key
 	// Revision is the last known version of the object.
 	Revision string
 }
@@ -194,7 +206,7 @@ type Watch struct {
 	Name string
 	// Prefixes specifies prefixes to watch,
 	// passed to the backend implementation
-	Prefixes [][]byte
+	Prefixes []Key
 	// QueueSize is an optional queue size
 	QueueSize int
 	// MetricComponent if set will start reporting
@@ -205,7 +217,7 @@ type Watch struct {
 // String returns a user-friendly description
 // of the watcher
 func (w *Watch) String() string {
-	return fmt.Sprintf("Watcher(name=%v, prefixes=%v)", w.Name, string(bytes.Join(w.Prefixes, []byte(", "))))
+	return fmt.Sprintf("Watcher(name=%v, prefixes=%v)", w.Name, w.Prefixes)
 }
 
 // Watcher returns watcher
@@ -238,14 +250,11 @@ type Event struct {
 // Item is a key value item
 type Item struct {
 	// Key is a key of the key value item
-	Key []byte
+	Key Key
 	// Value is a value of the key value item
 	Value []byte
 	// Expires is an optional record expiry time
 	Expires time.Time
-	// ID is a record ID, newer records have newer ids
-	// Deprecated: use Revision instead
-	ID int64
 	// Revision is the last known version of the object.
 	Revision string
 }
@@ -259,9 +268,9 @@ func (e Event) String() string {
 }
 
 // Config is used for 'storage' config section. It's a combination of
-// values for various backends: 'boltdb', 'etcd', 'filesystem' and 'dynamodb'
+// values for various backends: 'etcd', 'filesystem', 'dynamodb', etc.
 type Config struct {
-	// Type can be "bolt" or "etcd" or "dynamodb"
+	// Type indicates which backend to use (etcd, dynamodb, etc)
 	Type string `yaml:"type,omitempty"`
 
 	// Params is a generic key/value property bag which allows arbitrary
@@ -291,24 +300,24 @@ const NoLimit = 0
 // nextKey returns the next possible key.
 // If used with a key prefix, this will return
 // the end of the range for that key prefix.
-func nextKey(key []byte) []byte {
-	end := make([]byte, len(key))
-	copy(end, key)
+func nextKey(key Key) Key {
+	end := make([]byte, len(key.s))
+	copy(end, key.s)
 	for i := len(end) - 1; i >= 0; i-- {
 		if end[i] < 0xff {
 			end[i] = end[i] + 1
 			end = end[:i+1]
-			return end
+			return KeyFromString(string(end))
 		}
 	}
 	// next key does not exist (e.g., 0xffff);
-	return noEnd
+	return Key{noEnd: true}
 }
 
 var noEnd = []byte{0}
 
 // RangeEnd returns end of the range for given key.
-func RangeEnd(key []byte) []byte {
+func RangeEnd(key Key) Key {
 	return nextKey(key)
 }
 
@@ -328,8 +337,14 @@ type KeyedItem interface {
 // For items that implement HostID, the next key will also
 // have the HostID part.
 func NextPaginationKey(ki KeyedItem) string {
-	key := GetPaginationKey(ki)
-	return string(nextKey([]byte(key)))
+	var key Key
+	if h, ok := ki.(HostID); ok {
+		key = internalKey(h.GetHostID(), h.GetName())
+	} else {
+		key = NewKey(ki.GetName())
+	}
+
+	return nextKey(key).String()
 }
 
 // GetPaginationKey returns the pagination key given item.
@@ -337,7 +352,7 @@ func NextPaginationKey(ki KeyedItem) string {
 // have the HostID part.
 func GetPaginationKey(ki KeyedItem) string {
 	if h, ok := ki.(HostID); ok {
-		return string(internalKey(h.GetHostID(), h.GetName()))
+		return internalKey(h.GetHostID(), h.GetName()).String()
 	}
 
 	return ki.GetName()
@@ -345,13 +360,13 @@ func GetPaginationKey(ki KeyedItem) string {
 
 // MaskKeyName masks the given key name.
 // e.g "123456789" -> "******789"
-func MaskKeyName(keyName string) []byte {
+func MaskKeyName(keyName string) string {
 	maskedBytes := []byte(keyName)
 	hiddenBefore := int(0.75 * float64(len(keyName)))
 	for i := 0; i < hiddenBefore; i++ {
 		maskedBytes[i] = '*'
 	}
-	return maskedBytes
+	return string(maskedBytes)
 }
 
 // Items is a sortable list of backend items
@@ -369,7 +384,7 @@ func (it Items) Swap(i, j int) {
 
 // Less is part of sort.Interface.
 func (it Items) Less(i, j int) bool {
-	return bytes.Compare(it[i].Key, it[j].Key) < 0
+	return it[i].Key.Compare(it[j].Key) < 0
 }
 
 // TTL returns TTL in duration units, rounds up to one second
@@ -418,27 +433,6 @@ func (p earliest) Less(i, j int) bool {
 
 func (p earliest) Swap(i, j int) {
 	p[i], p[j] = p[j], p[i]
-}
-
-// Separator is used as a separator between key parts
-const Separator = '/'
-
-// Key joins parts into path separated by Separator,
-// makes sure path always starts with Separator ("/")
-func Key(parts ...string) []byte {
-	return internalKey("", parts...)
-}
-
-// ExactKey is like Key, except a Separator is appended to the result
-// path of Key. This is to ensure range matching of a path will only
-// math child paths and not other paths that have the resulting path
-// as a prefix.
-func ExactKey(parts ...string) []byte {
-	return append(Key(parts...), Separator)
-}
-
-func internalKey(internalPrefix string, parts ...string) []byte {
-	return []byte(strings.Join(append([]string{internalPrefix}, parts...), string(Separator)))
 }
 
 // CreateRevision generates a new identifier to be used

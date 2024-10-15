@@ -26,15 +26,17 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
-	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/integrations/awsoidc/tags"
+	"github.com/gravitational/teleport/lib/utils/teleportassets"
 )
 
 var (
@@ -43,19 +45,17 @@ var (
 	// requiredCapacityProviders contains the FARGATE type which is required to deploy a Teleport Service.
 	requiredCapacityProviders = []string{launchTypeFargateString}
 
-	// oneAgent is used to define the desired agent count when creating a service.
-	oneAgent = int32(1)
+	// twoAgents is used to define the desired agent count when creating a service.
+	// Deploying two agents in a FARGATE LaunchType Service, will most likely deploy
+	// each one in a different AZ, as long as the Subnets include mustiple AZs.
+	// From AWS Docs:
+	// > Task placement strategies and constraints aren't supported for tasks using the Fargate launch type.
+	// > Fargate will try its best to spread tasks across accessible Availability Zones.
+	// > https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-placement.html#fargate-launch-type
+	twoAgents = int32(2)
 )
 
 const (
-	// defaultTeleportIAMTokenName is the default Teleport IAM Token to use when it's not specified.
-	defaultTeleportIAMTokenName = "discover-aws-oidc-iam-token"
-
-	// distrolessTeleportOSS is the distroless image of the OSS version of Teleport
-	distrolessTeleportOSS = "public.ecr.aws/gravitational/teleport-distroless"
-	// distrolessTeleportEnt is the distroless image of the Enterprise version of Teleport
-	distrolessTeleportEnt = "public.ecr.aws/gravitational/teleport-ent-distroless"
-
 	// clusterStatusActive is the string representing an ACTIVE ECS Cluster.
 	clusterStatusActive = "ACTIVE"
 	// clusterStatusInactive is the string representing an INACTIVE ECS Cluster.
@@ -129,27 +129,18 @@ type DeployServiceRequest struct {
 	// TeleportClusterName is the Teleport Cluster Name, used to create default names for Cluster, Service and Task.
 	TeleportClusterName string
 
-	// TeleportIAMTokenNameis the Teleport IAM Token to use in the deployed Service.
-	// Optional.
-	// Defaults to discover-aws-oidc-iam-token
-	TeleportIAMTokenName string
-
-	// ProxyServerHostPort is the Teleport Proxy's Public.
-	ProxyServerHostPort string
+	// DeploymentJoinTokenName is the Teleport IAM Token to use in the deployed Service.
+	DeploymentJoinTokenName string
 
 	// IntegrationName is the integration name.
 	// Used for resource tagging when creating resources in AWS.
 	IntegrationName string
 
 	// ResourceCreationTags is used to add tags when creating resources in AWS.
-	ResourceCreationTags AWSTags
+	ResourceCreationTags tags.AWSTags
 
 	// DeploymentMode is the identifier of a deployment mode - which Teleport Services to enable and their configuration.
 	DeploymentMode string
-
-	// DatabaseResourceMatcherLabels contains the set of labels to be used by the DatabaseService.
-	// This is used when the deployment mode creates a Database Service.
-	DatabaseResourceMatcherLabels types.Labels
 
 	// TeleportVersionTag is the version of teleport to install.
 	// Ensure the tag exists in:
@@ -157,6 +148,10 @@ type DeployServiceRequest struct {
 	// Eg, 13.2.0
 	// Optional. Defaults to the current version.
 	TeleportVersionTag string
+
+	// TeleportConfigString is the `teleport.yaml` configuration for the service to be deployed.
+	// It should be base64 encoded as is expected by the `--config-string` param of `teleport start`.
+	TeleportConfigString string
 }
 
 // normalizeECSResourceName converts a name into a valid ECS Resource Name.
@@ -207,8 +202,8 @@ func (r *DeployServiceRequest) CheckAndSetDefaults() error {
 		r.TeleportVersionTag = teleport.Version
 	}
 
-	if r.TeleportIAMTokenName == "" {
-		r.TeleportIAMTokenName = defaultTeleportIAMTokenName
+	if r.DeploymentJoinTokenName == "" {
+		return trace.BadParameter("deployment join token name is required")
 	}
 
 	if r.DeploymentMode == "" {
@@ -246,20 +241,16 @@ func (r *DeployServiceRequest) CheckAndSetDefaults() error {
 		r.TaskName = &taskName
 	}
 
-	if r.ProxyServerHostPort == "" {
-		return trace.BadParameter("proxy address is required")
-	}
-
 	if r.IntegrationName == "" {
 		return trace.BadParameter("integration name is required")
 	}
 
 	if r.ResourceCreationTags == nil {
-		r.ResourceCreationTags = defaultResourceCreationTags(r.TeleportClusterName, r.IntegrationName)
+		r.ResourceCreationTags = tags.DefaultResourceCreationTags(r.TeleportClusterName, r.IntegrationName)
 	}
 
-	if len(r.DatabaseResourceMatcherLabels) == 0 {
-		return trace.BadParameter("at least one agent matcher label is required")
+	if r.TeleportConfigString == "" {
+		return trace.BadParameter("teleport config string is required")
 	}
 
 	return nil
@@ -327,13 +318,12 @@ type DeployServiceClient interface {
 	// Before deploying the service, it must ensure that the token exists and has the appropriate token rul.
 	TokenService
 
-	// GetCallerIdentity returns details about the IAM user or role whose credentials are used to call the operation.
-	GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error)
+	CallerIdentityGetter
 }
 
 type defaultDeployServiceClient struct {
+	CallerIdentityGetter
 	*ecs.Client
-	stsClient          *sts.Client
 	tokenServiceClient TokenService
 }
 
@@ -345,11 +335,6 @@ func (d *defaultDeployServiceClient) GetToken(ctx context.Context, name string) 
 // UpsertToken creates or updates a provision token.
 func (d *defaultDeployServiceClient) UpsertToken(ctx context.Context, token types.ProvisionToken) error {
 	return d.tokenServiceClient.UpsertToken(ctx, token)
-}
-
-// GetCallerIdentity returns details about the IAM user or role whose credentials are used to call the operation.
-func (d defaultDeployServiceClient) GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error) {
-	return d.stsClient.GetCallerIdentity(ctx, params, optFns...)
 }
 
 // NewDeployServiceClient creates a new DeployServiceClient using a AWSClientRequest.
@@ -365,9 +350,9 @@ func NewDeployServiceClient(ctx context.Context, clientReq *AWSClientRequest, to
 	}
 
 	return &defaultDeployServiceClient{
-		Client:             ecsClient,
-		stsClient:          stsClient,
-		tokenServiceClient: tokenServiceClient,
+		Client:               ecsClient,
+		CallerIdentityGetter: stsClient,
+		tokenServiceClient:   tokenServiceClient,
 	}, nil
 }
 
@@ -417,23 +402,13 @@ func DeployService(ctx context.Context, clt DeployServiceClient, req DeployServi
 	}
 
 	upsertTokenReq := upsertIAMJoinTokenRequest{
-		tokenName:      req.TeleportIAMTokenName,
+		tokenName:      req.DeploymentJoinTokenName,
 		accountID:      req.AccountID,
 		region:         req.Region,
 		iamRole:        req.TaskRoleARN,
 		deploymentMode: req.DeploymentMode,
 	}
 	if err := upsertIAMJoinToken(ctx, upsertTokenReq, clt); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	teleportConfigString, err := generateTeleportConfigString(generateTeleportConfigParams{
-		ProxyServerHostPort:           req.ProxyServerHostPort,
-		TeleportIAMTokenName:          req.TeleportIAMTokenName,
-		DeploymentMode:                req.DeploymentMode,
-		DatabaseResourceMatcherLabels: req.DatabaseResourceMatcherLabels,
-	})
-	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -445,7 +420,7 @@ func DeployService(ctx context.Context, clt DeployServiceClient, req DeployServi
 		TeleportVersionTag:   req.TeleportVersionTag,
 		ResourceCreationTags: req.ResourceCreationTags,
 		Region:               req.Region,
-		TeleportConfigB64:    teleportConfigString,
+		TeleportConfigB64:    req.TeleportConfigString,
 	}
 	taskDefinition, err := upsertTask(ctx, clt, upsertTaskReq)
 	if err != nil {
@@ -486,16 +461,19 @@ type upsertTaskRequest struct {
 	ClusterName          string
 	ServiceName          string
 	TeleportVersionTag   string
-	ResourceCreationTags AWSTags
+	ResourceCreationTags tags.AWSTags
 	Region               string
 	TeleportConfigB64    string
 }
 
 // upsertTask ensures a TaskDefinition with TaskName exists
 func upsertTask(ctx context.Context, clt DeployServiceClient, req upsertTaskRequest) (*ecsTypes.TaskDefinition, error) {
-	taskAgentContainerImage := getDistrolessTeleportImage(req.TeleportVersionTag)
+	taskAgentContainerImage, err := getDistrolessTeleportImage(req.TeleportVersionTag)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 
-	taskDefOut, err := clt.RegisterTaskDefinition(ctx, &ecs.RegisterTaskDefinitionInput{
+	taskDefIn := &ecs.RegisterTaskDefinitionInput{
 		Family: aws.String(req.TaskName),
 		RequiresCompatibilities: []ecsTypes.Compatibility{
 			ecsTypes.CompatibilityFargate,
@@ -507,10 +485,12 @@ func upsertTask(ctx context.Context, clt DeployServiceClient, req upsertTaskRequ
 		TaskRoleArn:      &req.TaskRoleARN,
 		ExecutionRoleArn: &req.TaskRoleARN,
 		ContainerDefinitions: []ecsTypes.ContainerDefinition{{
-			Environment: []ecsTypes.KeyValuePair{{
-				Name:  aws.String(types.InstallMethodAWSOIDCDeployServiceEnvVar),
-				Value: aws.String("true"),
-			}},
+			Environment: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String(types.InstallMethodAWSOIDCDeployServiceEnvVar),
+					Value: aws.String("true"),
+				},
+			},
 			Command: []string{
 				// --rewrite 15:3 rewrites SIGTERM -> SIGQUIT. This enables graceful shutdown of teleport
 				"--rewrite",
@@ -535,7 +515,15 @@ func upsertTask(ctx context.Context, clt DeployServiceClient, req upsertTaskRequ
 			},
 		}},
 		Tags: req.ResourceCreationTags.ToECSTags(),
-	})
+	}
+
+	// Ensure that the upgrader environment variables are set.
+	// These will ensure that the instance reports Teleport upgrader metrics.
+	if err := ensureUpgraderEnvironmentVariables(taskDefIn); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	taskDefOut, err := clt.RegisterTaskDefinition(ctx, taskDefIn)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -547,7 +535,7 @@ func upsertTask(ctx context.Context, clt DeployServiceClient, req upsertTaskRequ
 // It will re-create if its status is INACTIVE.
 // If the cluster status is not ACTIVE, an error is returned.
 // The cluster is returned.
-func upsertCluster(ctx context.Context, clt DeployServiceClient, clusterName string, resourceCreationTags AWSTags) (*ecsTypes.Cluster, error) {
+func upsertCluster(ctx context.Context, clt DeployServiceClient, clusterName string, resourceCreationTags tags.AWSTags) (*ecsTypes.Cluster, error) {
 	describeClustersResponse, err := clt.DescribeClusters(ctx, &ecs.DescribeClustersInput{
 		Clusters: []string{clusterName},
 		Include: []ecsTypes.ClusterField{
@@ -563,6 +551,22 @@ func upsertCluster(ctx context.Context, clt DeployServiceClient, clusterName str
 			ClusterName:       aws.String(clusterName),
 			CapacityProviders: requiredCapacityProviders,
 			Tags:              resourceCreationTags.ToECSTags(),
+		}, func(o *ecs.Options) {
+			o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
+				so.MaxAttempts = 10
+				so.MaxBackoff = time.Minute
+				// Retry if an error is a missing ECS service-linked role.
+				// This is a retryable error because the ECS service-linked role
+				// will be created automatically when the caller has
+				// iam:CreateServiceLinkedRole permission (we should).
+				// https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using-service-linked-roles.html#create-slr
+				so.Retryables = append(so.Retryables, retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
+					if err != nil && strings.Contains(err.Error(), "verify that the ECS service linked role exists") {
+						return aws.TrueTernary
+					}
+					return aws.FalseTernary
+				}))
+			})
 		})
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -676,7 +680,7 @@ func deployServiceNetworkConfiguration(subnetIDs, securityGroups []string) *ecsT
 type upsertServiceRequest struct {
 	ServiceName          string
 	ClusterName          string
-	ResourceCreationTags AWSTags
+	ResourceCreationTags tags.AWSTags
 	SubnetIDs            []string
 	SecurityGroups       []string
 }
@@ -722,7 +726,7 @@ func upsertService(ctx context.Context, clt DeployServiceClient, req upsertServi
 
 			updateServiceResp, err := clt.UpdateService(ctx, &ecs.UpdateServiceInput{
 				Service:              aws.String(req.ServiceName),
-				DesiredCount:         &oneAgent,
+				DesiredCount:         &twoAgents,
 				TaskDefinition:       &taskARN,
 				Cluster:              aws.String(req.ClusterName),
 				NetworkConfiguration: deployServiceNetworkConfiguration(req.SubnetIDs, req.SecurityGroups),
@@ -739,7 +743,7 @@ func upsertService(ctx context.Context, clt DeployServiceClient, req upsertServi
 
 	createServiceOut, err := clt.CreateService(ctx, &ecs.CreateServiceInput{
 		ServiceName:          aws.String(req.ServiceName),
-		DesiredCount:         &oneAgent,
+		DesiredCount:         &twoAgents,
 		LaunchType:           ecsTypes.LaunchTypeFargate,
 		TaskDefinition:       &taskARN,
 		Cluster:              aws.String(req.ClusterName),
@@ -755,10 +759,11 @@ func upsertService(ctx context.Context, clt DeployServiceClient, req upsertServi
 }
 
 // getDistrolessTeleportImage returns the distroless teleport image string
-func getDistrolessTeleportImage(version string) string {
-	teleportImage := distrolessTeleportOSS
-	if modules.GetModules().BuildType() == modules.BuildEnterprise {
-		teleportImage = distrolessTeleportEnt
+func getDistrolessTeleportImage(version string) (string, error) {
+	semVer, err := semver.NewVersion(version)
+	if err != nil {
+		return "", trace.BadParameter("invalid version tag %s", version)
 	}
-	return fmt.Sprintf("%s:%s", teleportImage, version)
+
+	return teleportassets.DistrolessImage(*semVer), nil
 }

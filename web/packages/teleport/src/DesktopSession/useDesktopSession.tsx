@@ -21,6 +21,7 @@ import { useParams } from 'react-router';
 
 import useAttempt from 'shared/hooks/useAttemptNext';
 
+import { ButtonState } from 'teleport/lib/tdp';
 import useWebAuthn from 'teleport/lib/useWebAuthn';
 import desktopService from 'teleport/services/desktops';
 import userService from 'teleport/services/user';
@@ -36,17 +37,19 @@ export default function useDesktopSession() {
   // tdpConnection tracks the state of the tdpClient's TDP connection
   // - 'processing' at first
   // - 'success' once the first TdpClientEvent.IMAGE_FRAGMENT is seen
-  // - 'failed' if a fatal error is encountered
+  // - 'failed' if a fatal error is encountered, should have a statusText
+  // - '' if the connection closed gracefully by the server, should have a statusText
   const { attempt: tdpConnection, setAttempt: setTdpConnection } =
     useAttempt('processing');
 
   // wsConnection track's the state of the tdpClient's websocket connection.
-  // 'closed' to start, 'open' when TdpClientEvent.WS_OPEN is encountered, then 'closed'
-  // again when TdpClientEvent.WS_CLOSE is encountered.
-  const [wsConnection, setWsConnection] = useState<'open' | 'closed'>('closed');
-
-  // disconnected tracks whether the user intentionally disconnected the client
-  const [disconnected, setDisconnected] = useState(false);
+  // - 'init' to start
+  // - 'open' when TdpClientEvent.WS_OPEN is encountered
+  // - then 'closed' again when TdpClientEvent.WS_CLOSE is encountered.
+  // Once it's 'closed', it should have the message that came with the TdpClientEvent.WS_CLOSE event..
+  const [wsConnection, setWsConnection] = useState<WebsocketAttempt>({
+    status: 'init',
+  });
 
   const { username, desktopName, clusterId } = useParams<UrlDesktopParams>();
 
@@ -80,7 +83,7 @@ export default function useDesktopSession() {
     useState(false);
 
   document.title = useMemo(
-    () => `${clusterId} • ${username}@${hostname}`,
+    () => `${username}@${hostname} • ${clusterId}`,
     [clusterId, hostname, username]
   );
 
@@ -109,9 +112,9 @@ export default function useDesktopSession() {
     );
   }, [clusterId, desktopName, run]);
 
-  const [warnings, setWarnings] = useState<NotificationItem[]>([]);
-  const onRemoveWarning = (id: string) => {
-    setWarnings(prevState => prevState.filter(warning => warning.id !== id));
+  const [alerts, setAlerts] = useState<NotificationItem[]>([]);
+  const onRemoveAlert = (id: string) => {
+    setAlerts(prevState => prevState.filter(alert => alert.id !== id));
   };
 
   const clientCanvasProps = useTdpClientCanvas({
@@ -123,7 +126,7 @@ export default function useDesktopSession() {
     setClipboardSharingState,
     setDirectorySharingState,
     clipboardSharingState,
-    setWarnings,
+    setAlerts,
   });
   const tdpClient = clientCanvasProps.tdpClient;
 
@@ -147,7 +150,7 @@ export default function useDesktopSession() {
             ...prevState,
             directorySelected: false,
           }));
-          setWarnings(prevState => [
+          setAlerts(prevState => [
             ...prevState,
             {
               id: crypto.randomUUID(),
@@ -161,7 +164,7 @@ export default function useDesktopSession() {
         ...prevState,
         directorySelected: false,
       }));
-      setWarnings(prevState => [
+      setAlerts(prevState => [
         ...prevState,
         {
           id: crypto.randomUUID(),
@@ -183,6 +186,15 @@ export default function useDesktopSession() {
     }
   };
 
+  const onCtrlAltDel = () => {
+    if (!tdpClient) {
+      return;
+    }
+    tdpClient.sendKeyboardInput('ControlLeft', ButtonState.DOWN);
+    tdpClient.sendKeyboardInput('AltLeft', ButtonState.DOWN);
+    tdpClient.sendKeyboardInput('Delete', ButtonState.DOWN);
+  };
+
   return {
     hostname,
     username,
@@ -193,15 +205,14 @@ export default function useDesktopSession() {
     fetchAttempt,
     tdpConnection,
     wsConnection,
-    disconnected,
-    setDisconnected,
     webauthn,
     setTdpConnection,
     showAnotherSessionActiveDialog,
     setShowAnotherSessionActiveDialog,
     onShareDirectory,
-    warnings,
-    onRemoveWarning,
+    onCtrlAltDel,
+    alerts,
+    onRemoveAlert,
     ...clientCanvasProps,
   };
 }
@@ -320,6 +331,26 @@ export function isSharingClipboard(
 }
 
 /**
+ * Provides a user-friendly message indicating whether clipboard sharing is enabled,
+ * and the reason it is disabled.
+ */
+export function clipboardSharingMessage(state: ClipboardSharingState): string {
+  if (!state.allowedByAcl) {
+    return 'Clipboard Sharing disabled by Teleport RBAC.';
+  }
+  if (!state.browserSupported) {
+    return 'Clipboard Sharing is not supported in this browser.';
+  }
+  if (state.readState === 'denied' || state.writeState === 'denied') {
+    return 'Clipboard Sharing disabled due to browser permissions.';
+  }
+
+  return isSharingClipboard(state)
+    ? 'Clipboard Sharing enabled.'
+    : 'Clipboard Sharing disabled.';
+}
+
+/**
  * Determines whether directory sharing is/should-be possible based on whether it's allowed by the acl
  * and whether it's supported by the browser.
  */
@@ -349,4 +380,9 @@ export const defaultDirectorySharingState: DirectorySharingState = {
 
 export const defaultClipboardSharingState: ClipboardSharingState = {
   browserSupported: navigator.userAgent.includes('Chrome'),
+};
+
+export type WebsocketAttempt = {
+  status: 'init' | 'open' | 'closed';
+  statusText?: string;
 };

@@ -23,7 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -60,7 +60,7 @@ func TestWriteMovieCanBeCanceled(t *testing.T) {
 	cancel()
 
 	frames, _, err := writeMovieWrapper(t, ctx, fs, "test", "test", nil)
-	require.ErrorIs(t, context.Canceled, err)
+	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 0, frames)
 }
 
@@ -129,13 +129,13 @@ func TestWriteMovieWritesManyFrames(t *testing.T) {
 	require.Equal(t, framesPerSecond, frames)
 }
 
-// Calls writeMovie, and tells the test state to cleanup the created files upon completion.
+// writeMovieWrapper calls writeMovie, and tells the test state to cleanup the created files upon completion.
 // Returns the writeMovie call results, as well as the path-qualified prefix to the created file.
 func writeMovieWrapper(t *testing.T, ctx context.Context, ss events.SessionStreamer, sid session.ID, prefix string,
 	write func(format string, args ...any) (int, error)) (int, string, error) {
 
 	tempDir := t.TempDir()
-	prefix = path.Join(tempDir, prefix)
+	prefix = filepath.Join(tempDir, prefix)
 	frames, err := writeMovie(ctx, ss, sid, prefix, write, "")
 	return frames, prefix, err
 }

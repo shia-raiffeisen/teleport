@@ -19,8 +19,6 @@
 package backend
 
 import (
-	"context"
-
 	"github.com/gravitational/trace"
 )
 
@@ -178,7 +176,7 @@ func Delete() Action {
 type ConditionalAction struct {
 	// Key is the key against which the associated condition and action are to
 	// be applied.
-	Key []byte
+	Key Key
 
 	// Condition must be one of Exists|NotExists|Revision(<revision>)|Whatever
 	Condition Condition
@@ -189,7 +187,7 @@ type ConditionalAction struct {
 
 // Check validates the basic correctness of the conditional action.
 func (c *ConditionalAction) Check() error {
-	if len(c.Key) == 0 {
+	if len(c.Key.s) == 0 {
 		return trace.BadParameter("conditional action missing required parameter 'Key'")
 	}
 
@@ -223,24 +221,9 @@ const (
 	MaxAtomicWriteSize = 64
 )
 
-// AtomicWriter is a standalone interface for the AtomicWrite method. This interface will be deprecated
-// once all backends implement AtomicWrite.
-type AtomicWriter interface {
-	// AtomicWrite executes a batch of conditional actions atomically s.t. all actions happen if all
-	// conditions are met, but no actions happen if any condition fails to hold. If one or more conditions
-	// failed to hold, [ErrConditionFailed] is returned. The number of conditional actions must not
-	// exceed [MaxAtomicWriteSize] and no two conditional actions may point to the same key. If successful,
-	// the returned revision is the new revision associated with all [Put] actions that were part of the
-	// operation (the revision value has no meaning outside of the context of puts).
-	AtomicWrite(ctx context.Context, condacts []ConditionalAction) (revision string, err error)
-}
-
-// AtomicWriterBackend joins the AtomicWrite interface with the standard backend interface. This interface
-// will be deprecated once all backends implement AtomicWrite.
-type AtomicWriterBackend interface {
-	Backend
-	AtomicWriter
-}
+// AtomicWriterBackend was used to extend the backend interface with the AtomicWrite method prior to all backends
+// implementing AtomicWrite. This alias can be safely deleted once it is no longer referenced by enterprise backend logic.
+type AtomicWriterBackend = Backend
 
 // ValidateAtomicWrite verifies that the supplied group of conditional actions are a valid input for atomic
 // application. This means both verifying that each individual conditional action is well-formed, and also
@@ -265,7 +248,7 @@ func ValidateAtomicWrite(condacts []ConditionalAction) error {
 
 		containsWrite = containsWrite || condacts[i].Action.IsWrite()
 
-		key := string(condacts[i].Key)
+		key := condacts[i].Key.String()
 
 		if _, ok := keys[key]; ok {
 			return trace.BadParameter("multiple conditional actions target key %q", key)

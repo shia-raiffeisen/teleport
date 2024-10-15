@@ -25,6 +25,8 @@ import (
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/types/accesslist"
 	resourcesv1 "github.com/gravitational/teleport/integrations/operator/apis/resources/v1"
+	"github.com/gravitational/teleport/integrations/operator/controllers"
+	"github.com/gravitational/teleport/integrations/operator/controllers/reconcilers"
 )
 
 // accessListClient implements TeleportResourceClient and offers CRUD methods needed to reconcile access_lists.
@@ -55,20 +57,24 @@ func (r accessListClient) Delete(ctx context.Context, name string) error {
 	return trace.Wrap(r.teleportClient.AccessListClient().DeleteAccessList(ctx, name))
 }
 
-// MutateExisting propagates fields from the existing AccessList resource
+// Mutate propagates fields from the existing AccessList resource
 // to the one the operator will upsert. This allows propagating fields computed
 // server-side such as the NextAuditDate.
-func (r accessListClient) MutateExisting(new, existing *accesslist.AccessList) {
+func (r accessListClient) Mutate(_ context.Context, new, existing *accesslist.AccessList, _ kclient.ObjectKey) error {
+	if existing == nil {
+		return nil
+	}
 	new.Spec.Audit.NextAuditDate = existing.Spec.Audit.NextAuditDate
+	return nil
 }
 
 // NewAccessListReconciler instantiates a new Kubernetes controller reconciling access_list resources
-func NewAccessListReconciler(client kclient.Client, tClient *client.Client) (Reconciler, error) {
+func NewAccessListReconciler(client kclient.Client, tClient *client.Client) (controllers.Reconciler, error) {
 	accessListClient := &accessListClient{
 		teleportClient: tClient,
 	}
 
-	resourceReconciler, err := NewTeleportResourceReconciler[*accesslist.AccessList, *resourcesv1.TeleportAccessList](
+	resourceReconciler, err := reconcilers.NewTeleportResourceWithLabelsReconciler[*accesslist.AccessList, *resourcesv1.TeleportAccessList](
 		client,
 		accessListClient,
 	)

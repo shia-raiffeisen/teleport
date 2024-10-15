@@ -27,6 +27,7 @@ import (
 	"github.com/jonboulle/clockwork"
 	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/backend"
@@ -52,7 +53,7 @@ func (cfg *ClusterExternalAuditStorageWatcherConfig) CheckAndSetDefaults() error
 		return trace.BadParameter("missing parameter Backend")
 	}
 	if cfg.Log == nil {
-		cfg.Log = logrus.StandardLogger().WithField(trace.Component, "ExternalAuditStorage.watcher")
+		cfg.Log = logrus.StandardLogger().WithField(teleport.ComponentKey, "ExternalAuditStorage.watcher")
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = cfg.Backend.Clock()
@@ -171,7 +172,7 @@ func (w *ClusterExternalAuditWatcher) watch(ctx context.Context) error {
 func (w *ClusterExternalAuditWatcher) newWatcher(ctx context.Context) (backend.Watcher, error) {
 	watcher, err := w.backend.NewWatcher(ctx, backend.Watch{
 		Name:     types.KindExternalAuditStorage,
-		Prefixes: [][]byte{clusterExternalAuditStorageBackendKey},
+		Prefixes: []backend.Key{clusterExternalAuditStorageBackendKey},
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)

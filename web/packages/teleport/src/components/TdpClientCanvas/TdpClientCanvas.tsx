@@ -17,6 +17,7 @@
  */
 
 import React, { memo, useEffect, useRef } from 'react';
+import { DebouncedFunc } from 'shared/utils/highbar';
 
 import { TdpClientEvent, TdpClient } from 'teleport/lib/tdp';
 import { BitmapFrame } from 'teleport/lib/tdp/client';
@@ -38,6 +39,7 @@ function TdpClientCanvas(props: Props) {
     clientOnClipboardData,
     clientOnTdpError,
     clientOnTdpWarning,
+    clientOnTdpInfo,
     clientOnWsClose,
     clientOnWsOpen,
     clientOnClientScreenSpec,
@@ -49,7 +51,9 @@ function TdpClientCanvas(props: Props) {
     canvasOnMouseUp,
     canvasOnMouseWheelScroll,
     canvasOnContextMenu,
+    windowOnResize,
     style,
+    updatePointer,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -98,6 +102,51 @@ function TdpClientCanvas(props: Props) {
   }, [client, clientOnPngFrame]);
 
   useEffect(() => {
+    if (client && updatePointer) {
+      const canvas = canvasRef.current;
+      const updatePointer = (pointer: {
+        data: ImageData | boolean;
+        hotspot_x?: number;
+        hotspot_y?: number;
+      }) => {
+        if (typeof pointer.data === 'boolean') {
+          canvas.style.cursor = pointer.data ? 'default' : 'none';
+          return;
+        }
+        let cursor = document.createElement('canvas');
+        cursor.width = pointer.data.width;
+        cursor.height = pointer.data.height;
+        cursor
+          .getContext('2d', { colorSpace: pointer.data.colorSpace })
+          .putImageData(pointer.data, 0, 0);
+        if (pointer.data.width > 32 || pointer.data.height > 32) {
+          // scale the cursor down to at most 32px - max size fully supported by browsers
+          const resized = document.createElement('canvas');
+          let scale = Math.min(32 / cursor.width, 32 / cursor.height);
+          resized.width = cursor.width * scale;
+          resized.height = cursor.height * scale;
+
+          let context = resized.getContext('2d', {
+            colorSpace: pointer.data.colorSpace,
+          });
+          context.scale(scale, scale);
+          context.drawImage(cursor, 0, 0);
+          cursor = resized;
+        }
+        canvas.style.cursor = `url(${cursor.toDataURL()}) ${
+          pointer.hotspot_x
+        } ${pointer.hotspot_y}, auto`;
+      };
+
+      client.addListener(TdpClientEvent.POINTER, updatePointer);
+
+      return () => {
+        client.removeListener(TdpClientEvent.POINTER, updatePointer);
+      };
+    }
+  }, [client, updatePointer]);
+
+  useEffect(() => {
     if (client && clientOnBmpFrame) {
       const canvas = canvasRef.current;
       const ctx = canvas.getContext('2d');
@@ -107,7 +156,9 @@ function TdpClientCanvas(props: Props) {
       const renderBuffer = () => {
         if (bitmapBuffer.length) {
           for (let i = 0; i < bitmapBuffer.length; i++) {
-            clientOnBmpFrame(ctx, bitmapBuffer[i]);
+            if (bitmapBuffer[i].image_data.data.length != 0) {
+              clientOnBmpFrame(ctx, bitmapBuffer[i]);
+            }
           }
           bitmapBuffer = [];
         }
@@ -186,6 +237,16 @@ function TdpClientCanvas(props: Props) {
       };
     }
   }, [client, clientOnTdpWarning]);
+
+  useEffect(() => {
+    if (client && clientOnTdpInfo) {
+      client.on(TdpClientEvent.TDP_INFO, clientOnTdpInfo);
+
+      return () => {
+        client.removeListener(TdpClientEvent.TDP_INFO, clientOnTdpInfo);
+      };
+    }
+  }, [client, clientOnTdpInfo]);
 
   useEffect(() => {
     if (client && clientOnWsClose) {
@@ -323,6 +384,17 @@ function TdpClientCanvas(props: Props) {
   }, [client, canvasOnFocusOut]);
 
   useEffect(() => {
+    if (client && windowOnResize) {
+      const _onresize = () => windowOnResize(client);
+      window.addEventListener('resize', _onresize);
+      return () => {
+        windowOnResize.cancel();
+        window.removeEventListener('resize', _onresize);
+      };
+    }
+  }, [client, windowOnResize]);
+
+  useEffect(() => {
     if (client) {
       const canvas = canvasRef.current;
       const _clearCanvas = () => {
@@ -369,7 +441,8 @@ export type Props = {
   clientOnClipboardData?: (clipboardData: ClipboardData) => void;
   clientOnTdpError?: (error: Error) => void;
   clientOnTdpWarning?: (warning: string) => void;
-  clientOnWsClose?: () => void;
+  clientOnTdpInfo?: (info: string) => void;
+  clientOnWsClose?: (message: string) => void;
   clientOnWsOpen?: () => void;
   clientOnClientScreenSpec?: (
     cli: TdpClient,
@@ -388,7 +461,9 @@ export type Props = {
   canvasOnMouseUp?: (cli: TdpClient, e: MouseEvent) => void;
   canvasOnMouseWheelScroll?: (cli: TdpClient, e: WheelEvent) => void;
   canvasOnContextMenu?: () => boolean;
+  windowOnResize?: DebouncedFunc<(cli: TdpClient) => void>;
   style?: CSSProperties;
+  updatePointer?: boolean;
 };
 
 export default memo(TdpClientCanvas);

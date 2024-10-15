@@ -16,10 +16,9 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { MemoryRouter } from 'react-router';
-import { rest } from 'msw';
-import { mswLoader } from 'msw-storybook-addon';
+import { http, HttpResponse, delay } from 'msw';
 
 import cfg from 'teleport/config';
 import { createTeleportContext } from 'teleport/mocks/contexts';
@@ -27,15 +26,29 @@ import { ResourceKind } from 'teleport/Discover/Shared';
 import { PingTeleportProvider } from 'teleport/Discover/Shared/PingTeleportContext';
 import { ContextProvider } from 'teleport';
 
+import {
+  INTERNAL_RESOURCE_ID_LABEL_KEY,
+  JoinToken,
+} from 'teleport/services/joinToken';
+import { clearCachedJoinTokenResult } from 'teleport/Discover/Shared/useJoinTokenSuspender';
+import {
+  DiscoverContextState,
+  DiscoverProvider,
+} from 'teleport/Discover/useDiscover';
+import {
+  IntegrationKind,
+  IntegrationStatusCode,
+} from 'teleport/services/integrations';
+import { DiscoverEventResource } from 'teleport/services/userEvent';
+
 import { generateCmd } from 'teleport/Discover/Kubernetes/HelmChart/HelmChart';
 
-import { ManualHelmDialog } from './ManualHelmDialog';
-import { AgentWaitingDialog } from './AgentWaitingDialog';
 import { EnrollmentDialog } from './EnrollmentDialog';
+import { AgentWaitingDialog } from './AgentWaitingDialog';
+import { ManualHelmDialog } from './ManualHelmDialog';
 
 export default {
   title: 'Teleport/Discover/Kube/EnrollEksClusters/Dialogs',
-  loaders: [mswLoader],
 };
 
 export const EnrollmentDialogStory = () => (
@@ -74,8 +87,8 @@ AgentWaitingDialogStory.storyName = 'AgentWaitingDialog';
 AgentWaitingDialogStory.parameters = {
   msw: {
     handlers: [
-      rest.get(cfg.api.kubernetesPath, (req, res, ctx) => {
-        return res(ctx.delay('infinite'));
+      http.get(cfg.api.kubernetesPath, () => {
+        return delay('infinite');
       }),
     ],
   },
@@ -103,14 +116,14 @@ export const AgentWaitingDialogSuccess = () => (
 AgentWaitingDialogSuccess.parameters = {
   msw: {
     handlers: [
-      rest.get(cfg.api.kubernetesPath, (req, res, ctx) => {
-        return res(ctx.delay('infinite'));
+      http.get(cfg.api.kubernetesPath, () => {
+        return delay('infinite');
       }),
     ],
   },
 };
 
-const helmCommand = generateCmd({
+const helmCommandProps = {
   namespace: 'teleport-agent',
   clusterName: 'EKS1',
   proxyAddr: 'teleport-proxy.example.com:1234',
@@ -126,15 +139,98 @@ const helmCommand = generateCmd({
     { name: 'region', value: 'us-east-1' },
     { name: 'account-id', value: '1234567789012' },
   ],
-});
+};
 
-export const ManualHelmDialogStory = () => (
-  <MemoryRouter initialEntries={[{ state: { discover: {} } }]}>
-    <ManualHelmDialog
-      command={helmCommand}
-      confirmedCommands={() => {}}
-      cancel={() => {}}
-    />
-  </MemoryRouter>
-);
+export const ManualHelmDialogStory = () => {
+  const discoverCtx: DiscoverContextState = {
+    agentMeta: {
+      resourceName: 'kube-name',
+      agentMatcherLabels: [],
+      kube: {
+        kind: 'kube_cluster',
+        name: '',
+        labels: [],
+      },
+      awsIntegration: {
+        kind: IntegrationKind.AwsOidc,
+        name: 'test-oidc',
+        resourceType: 'integration',
+        spec: {
+          roleArn: 'arn:aws:iam::123456789012:role/test-role-arn',
+          issuerS3Bucket: '',
+          issuerS3Prefix: '',
+        },
+        statusCode: IntegrationStatusCode.Running,
+      },
+    },
+    currentStep: 0,
+    nextStep: () => null,
+    prevStep: () => null,
+    onSelectResource: () => null,
+    resourceSpec: {
+      name: 'Eks',
+      kind: ResourceKind.Kubernetes,
+      icon: 'eks',
+      keywords: [],
+      event: DiscoverEventResource.KubernetesEks,
+    },
+    exitFlow: () => null,
+    viewConfig: null,
+    indexedViews: [],
+    setResourceSpec: () => null,
+    updateAgentMeta: () => null,
+    emitErrorEvent: () => null,
+    emitEvent: () => null,
+    eventState: null,
+  };
+
+  useEffect(() => {
+    return () => {
+      clearCachedJoinTokenResult([
+        ResourceKind.Kubernetes,
+        ResourceKind.Application,
+        ResourceKind.Discovery,
+      ]);
+    };
+  }, []);
+
+  const [, setToken] = useState<JoinToken>();
+
+  return (
+    <MemoryRouter
+      initialEntries={[
+        { pathname: cfg.routes.discover, state: { entity: 'eks' } },
+      ]}
+    >
+      <ContextProvider ctx={createTeleportContext()}>
+        <DiscoverProvider mockCtx={discoverCtx}>
+          <ManualHelmDialog
+            setJoinTokenAndGetCommand={token => {
+              // Emulate real usage of ManualHelmDialog where setJoinTokenAndGetCommand updates the
+              // state of a parent.
+              setToken(token);
+              return generateCmd(helmCommandProps);
+            }}
+            confirmedCommands={() => {}}
+            cancel={() => {}}
+          />
+        </DiscoverProvider>
+      </ContextProvider>
+    </MemoryRouter>
+  );
+};
 ManualHelmDialogStory.storyName = 'ManualHelmDialog';
+ManualHelmDialogStory.parameters = {
+  msw: {
+    handlers: [
+      http.post(cfg.api.joinTokenPath, () => {
+        return HttpResponse.json({
+          id: 'token-id',
+          suggestedLabels: [
+            { name: INTERNAL_RESOURCE_ID_LABEL_KEY, value: 'resource-id' },
+          ],
+        });
+      }),
+    ],
+  },
+};

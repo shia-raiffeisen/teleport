@@ -18,13 +18,13 @@
 
 import { ITshdEventsService } from 'gen-proto-ts/teleport/lib/teleterm/v1/tshd_events_service_pb.grpc-server';
 
-import { sendUnaryData, ServerUnaryCall } from 'grpc';
+import { sendUnaryData, ServerUnaryCall } from '@grpc/grpc-js';
 
 import { Logger, LoggerService } from 'teleterm/services/logger/types';
 import { FileStorage } from 'teleterm/services/fileStorage';
 import { MainProcessClient, RuntimeSettings } from 'teleterm/mainProcess/types';
 import { PtyServiceClient } from 'teleterm/services/pty';
-import { TshdClient } from 'teleterm/services/tshd/types';
+import { VnetClient, TshdClient } from 'teleterm/services/tshd/createClient';
 
 export type {
   Logger,
@@ -97,19 +97,20 @@ export type TshdEventContextBridgeService = {
   >;
 };
 
-export type ExtractRequestType<T> = T extends ServerUnaryCall<infer Req, any>
-  ? Req
-  : never;
+export type ExtractRequestType<T> =
+  T extends ServerUnaryCall<infer Req, any> ? Req : never;
 
-export type ExtractResponseType<T> = T extends sendUnaryData<infer Res>
-  ? Res
-  : never;
+export type ExtractResponseType<T> =
+  T extends sendUnaryData<infer Res> ? Res : never;
 
 export type ElectronGlobals = {
   readonly mainProcessClient: MainProcessClient;
   readonly tshClient: TshdClient;
+  readonly vnetClient: VnetClient;
   readonly ptyServiceClient: PtyServiceClient;
   readonly setupTshdEventContextBridgeService: (
     listener: TshdEventContextBridgeService
   ) => void;
+  /** Exposes Electron's webUtils.getPathForFile. */
+  getPathForFile(file: File): string;
 };

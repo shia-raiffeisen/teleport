@@ -29,7 +29,8 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/web/ui"
+	"github.com/gravitational/teleport/lib/ui"
+	webui "github.com/gravitational/teleport/lib/web/ui"
 )
 
 func TestCreateNode(t *testing.T) {
@@ -47,7 +48,7 @@ func TestCreateNode(t *testing.T) {
 			Hostname: "myhostname",
 			Addr:     "172.31.1.1:22",
 			Labels:   []ui.Label{},
-			AWSInfo: &ui.AWSMetadata{
+			AWSInfo: &webui.AWSMetadata{
 				AccountID:   "123456789012",
 				InstanceID:  "i-123",
 				Region:      "us-east-1",
@@ -156,15 +157,15 @@ func TestCreateNode(t *testing.T) {
 			node, err := env.proxies[0].client.GetNode(ctx, "default", tt.req.Name)
 			require.NoError(t, err)
 
-			require.Equal(t, node.GetName(), tt.req.Name)
-			require.Equal(t, node.GetAWSInfo(), &types.AWSInfo{
+			require.Equal(t, tt.req.Name, node.GetName())
+			require.Equal(t, &types.AWSInfo{
 				AccountID:   tt.req.AWSInfo.AccountID,
 				InstanceID:  tt.req.AWSInfo.InstanceID,
 				Region:      tt.req.AWSInfo.Region,
 				VPCID:       tt.req.AWSInfo.VPCID,
 				Integration: tt.req.AWSInfo.Integration,
 				SubnetID:    tt.req.AWSInfo.SubnetID,
-			})
+			}, node.GetAWSInfo())
 		}
 	})
 

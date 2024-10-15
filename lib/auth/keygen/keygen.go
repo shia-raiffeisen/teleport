@@ -22,12 +22,12 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
@@ -44,9 +44,6 @@ import (
 // Keygen is a key generator that precomputes keys to provide quick access to
 // public/private key pairs.
 type Keygen struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
 	// clock is used to control time.
 	clock clockwork.Clock
 }
@@ -62,12 +59,9 @@ func SetClock(clock clockwork.Clock) Option {
 }
 
 // New returns a new key generator.
-func New(ctx context.Context, opts ...Option) *Keygen {
-	ctx, cancel := context.WithCancel(ctx)
+func New(_ context.Context, opts ...Option) *Keygen {
 	k := &Keygen{
-		ctx:    ctx,
-		cancel: cancel,
-		clock:  clockwork.NewRealClock(),
+		clock: clockwork.NewRealClock(),
 	}
 	for _, opt := range opts {
 		opt(k)
@@ -76,13 +70,7 @@ func New(ctx context.Context, opts ...Option) *Keygen {
 	return k
 }
 
-// Close stops the precomputation of keys (if enabled) and releases all resources.
-func (k *Keygen) Close() {
-	k.cancel()
-}
-
-// GenerateKeyPair returns fresh priv/pub keypair, takes about 300ms to
-// execute.
+// GenerateKeyPair returns fresh priv/pub keypair, takes about 300ms to execute.
 func (k *Keygen) GenerateKeyPair() ([]byte, []byte, error) {
 	return native.GenerateKeyPair()
 }
@@ -137,8 +125,11 @@ func (k *Keygen) GenerateHostCertWithoutValidation(c services.HostCertParams) ([
 		return nil, trace.Wrap(err)
 	}
 
-	log.Debugf("Generated SSH host certificate for role %v with principals: %v.",
-		c.Role, principals)
+	slog.DebugContext(
+		context.TODO(),
+		"Generated SSH host certificate.",
+		"role", c.Role, "principals", principals,
+	)
 	return ssh.MarshalAuthorizedKey(cert), nil
 }
 
@@ -162,7 +153,13 @@ func (k *Keygen) GenerateUserCertWithoutValidation(c services.UserCertParams) ([
 	if c.TTL != 0 {
 		b := k.clock.Now().UTC().Add(c.TTL)
 		validBefore = uint64(b.Unix())
-		log.Debugf("generated user key for %v with expiry on (%v) %v", c.AllowedLogins, validBefore, b)
+		slog.DebugContext(
+			context.TODO(),
+			"Generated user key with expiry.",
+			"allowed_logins", c.AllowedLogins,
+			"valid_before_unix_ts", validBefore,
+			"valid_before", b,
+		)
 	}
 	cert := &ssh.Certificate{
 		// we have to use key id to identify teleport user
@@ -208,6 +205,9 @@ func (k *Keygen) GenerateUserCertWithoutValidation(c services.UserCertParams) ([
 	}
 	if c.BotName != "" {
 		cert.Permissions.Extensions[teleport.CertExtensionBotName] = c.BotName
+	}
+	if c.BotInstanceID != "" {
+		cert.Permissions.Extensions[teleport.CertExtensionBotInstanceID] = c.BotInstanceID
 	}
 	if c.AllowedResourceIDs != "" {
 		cert.Permissions.Extensions[teleport.CertExtensionAllowedResources] = c.AllowedResourceIDs

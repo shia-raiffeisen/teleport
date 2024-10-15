@@ -17,18 +17,17 @@
  */
 
 import React, {
+  createContext,
   ReactNode,
   Suspense,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
-  lazy,
   useState,
-  createContext,
-  useContext,
 } from 'react';
 import styled from 'styled-components';
-import { Box, Indicator } from 'design';
+import { Box, Flex, Indicator } from 'design';
 import { Failed } from 'design/CardError';
 
 import useAttempt from 'shared/hooks/useAttemptNext';
@@ -36,25 +35,25 @@ import useAttempt from 'shared/hooks/useAttemptNext';
 import { matchPath, useHistory } from 'react-router';
 
 import Dialog from 'design/Dialog';
-import { sharedStyles } from 'design/theme/themes/sharedStyles';
-
-import { AssistViewMode } from 'gen-proto-ts/teleport/userpreferences/v1/assist_pb';
 
 import { Redirect, Route, Switch } from 'teleport/components/Router';
 import { CatchError } from 'teleport/components/CatchError';
 import cfg from 'teleport/config';
 import useTeleport from 'teleport/useTeleport';
 import { TopBar } from 'teleport/TopBar';
+import { TopBar as TopBarSideNav } from 'teleport/TopBar/TopBarSideNav';
 import { BannerList } from 'teleport/components/BannerList';
 import { storageService } from 'teleport/services/storageService';
-import { ClusterAlert, LINK_LABEL } from 'teleport/services/alerts/alerts';
+import {
+  ClusterAlert,
+  LINK_TEXT_LABEL,
+  LINK_DESTINATION_LABEL,
+} from 'teleport/services/alerts/alerts';
 import { useAlerts } from 'teleport/components/BannerList/useAlerts';
 import { FeaturesContextProvider, useFeatures } from 'teleport/FeaturesContext';
-import {
-  getFirstRouteForCategory,
-  Navigation,
-} from 'teleport/Navigation/Navigation';
-import { NavigationCategory } from 'teleport/Navigation/categories';
+
+import { Navigation as SideNavigation } from 'teleport/Navigation/SideNavigation/Navigation';
+import { Navigation } from 'teleport/Navigation';
 import { TopBarProps } from 'teleport/TopBar/TopBar';
 import { useUser } from 'teleport/User/UserContext';
 import { QuestionnaireProps } from 'teleport/Welcome/NewCredentials';
@@ -64,8 +63,6 @@ import { OnboardDiscover } from './OnboardDiscover';
 
 import type { BannerType } from 'teleport/components/BannerList/BannerList';
 import type { LockedFeatures, TeleportFeature } from 'teleport/types';
-
-const Assist = lazy(() => import('teleport/Assist'));
 
 export interface MainProps {
   initialAlerts?: ClusterAlert[];
@@ -83,40 +80,53 @@ export function Main(props: MainProps) {
 
   const { attempt, setAttempt, run } = useAttempt('processing');
 
+  const { preferences } = useUser();
+
+  const isTopBarView = storageService.getIsTopBarView();
+  const TopBarComponent =
+    //TODO(rudream): Add sidenav dashboard view.
+    isTopBarView || cfg.isDashboard ? TopBar : TopBarSideNav;
+  const NavigationComponent =
+    isTopBarView || cfg.isDashboard ? Navigation : SideNavigation;
+
   useEffect(() => {
     if (ctx.storeUser.state) {
       setAttempt({ status: 'success' });
       return;
     }
 
-    run(() => ctx.init());
+    run(() => ctx.init(preferences));
   }, []);
 
-  const { preferences } = useUser();
-  const viewMode = preferences?.assist?.viewMode;
-  const assistEnabled = ctx.getFeatureFlags().assist && ctx.assistEnabled;
-  const [showAssist, setShowAssist] = useState(false);
   const featureFlags = ctx.getFeatureFlags();
 
   const features = useMemo(
     () => props.features.filter(feature => feature.hasAccess(featureFlags)),
     [featureFlags, props.features]
   );
-  const feature = features
-    .filter(feature => Boolean(feature.route))
-    .find(f =>
-      matchPath(history.location.pathname, {
-        path: f.route.path,
-        exact: f.route.exact ?? false,
-      })
-    );
 
   const { alerts, dismissAlert } = useAlerts(props.initialAlerts);
 
-  const [showOnboardDiscover, setShowOnboardDiscover] = useState(true);
+  // if there is a redirectUrl, do not show the onboarding popup - it'll get in the way of the redirected page
+  const [showOnboardDiscover, setShowOnboardDiscover] = useState(
+    !ctx.redirectUrl
+  );
   const [showOnboardSurvey, setShowOnboardSurvey] = useState<boolean>(
     !!props.Questionnaire
   );
+
+  useEffect(() => {
+    if (
+      matchPath(history.location.pathname, {
+        path: ctx.redirectUrl,
+        exact: true,
+      })
+    ) {
+      // hide the onboarding popup if we're on the redirectUrl, just in case
+      setShowOnboardDiscover(false);
+      ctx.redirectUrl = null;
+    }
+  }, [ctx, history.location.pathname]);
 
   if (attempt.status === 'failed') {
     return <Failed message={attempt.statusText} />;
@@ -149,9 +159,13 @@ export function Main(props: MainProps) {
   if (
     matchPath(history.location.pathname, { path: cfg.routes.root, exact: true })
   ) {
+    if (ctx.redirectUrl) {
+      return <Redirect to={ctx.redirectUrl} />;
+    }
+
     const indexRoute = cfg.isDashboard
       ? cfg.routes.downloadCenter
-      : getFirstRouteForCategory(features, NavigationCategory.Resources);
+      : cfg.getUnifiedResourcesRoute(cfg.proxyCluster);
 
     return <Redirect to={indexRoute} />;
   }
@@ -168,42 +182,34 @@ export function Main(props: MainProps) {
     return 'danger';
   };
 
-  const banners: BannerType[] = alerts.map(alert => ({
-    message: alert.spec.message,
-    severity: mapSeverity(alert.spec.severity),
-    link: alert.metadata.labels[LINK_LABEL],
-    id: alert.metadata.name,
-  }));
+  const banners: BannerType[] = alerts.map(
+    (alert): BannerType => ({
+      message: alert.spec.message,
+      severity: mapSeverity(alert.spec.severity),
+      linkDestination: alert.metadata.labels[LINK_DESTINATION_LABEL],
+      linkText: alert.metadata.labels[LINK_TEXT_LABEL],
+      id: alert.metadata.name,
+    })
+  );
 
   const onboard = storageService.getOnboardDiscover();
   const requiresOnboarding =
     onboard && !onboard.hasResource && !onboard.notified;
   const displayOnboardDiscover = requiresOnboarding && showOnboardDiscover;
-  const hasSidebar =
-    feature?.category === NavigationCategory.Management &&
-    !feature?.hideNavigation;
 
   return (
     <FeaturesContextProvider value={features}>
-      <TopBar
+      <TopBarComponent
         CustomLogo={
           props.topBarProps?.showPoweredByLogo
             ? props.topBarProps.CustomLogo
             : null
         }
-        assistProps={{
-          showAssist,
-          setShowAssist,
-          assistEnabled,
-        }}
       />
       <Wrapper>
         <MainContainer>
-          <Navigation />
-          <HorizontalSplit
-            dockedView={showAssist && viewMode === AssistViewMode.DOCKED}
-            hasSidebar={hasSidebar}
-          >
+          <NavigationComponent />
+          <ContentWrapper>
             <ContentMinWidth>
               <BannerList
                 banners={banners}
@@ -215,13 +221,7 @@ export function Main(props: MainProps) {
                 <FeatureRoutes lockedFeatures={ctx.lockedFeatures} />
               </Suspense>
             </ContentMinWidth>
-          </HorizontalSplit>
-
-          {showAssist && (
-            <Suspense fallback={null}>
-              <Assist onClose={() => setShowAssist(false)} />
-            </Suspense>
-          )}
+          </ContentWrapper>
         </MainContainer>
       </Wrapper>
       {displayOnboardDiscover && (
@@ -328,7 +328,7 @@ export const useNoMinWidth = () => {
   }, []);
 };
 
-const ContentMinWidth = ({ children }: { children: ReactNode }) => {
+export const ContentMinWidth = ({ children }: { children: ReactNode }) => {
   const [enforceMinWidth, setEnforceMinWidth] = useState(true);
 
   return (
@@ -347,39 +347,26 @@ const ContentMinWidth = ({ children }: { children: ReactNode }) => {
   );
 };
 
-function getWidth(hasSidebar: boolean, isDockedView: boolean) {
-  const { dockedAssistWidth, sidebarWidth } = sharedStyles;
-  if (hasSidebar && isDockedView) {
-    return `max-width: calc(100% - ${sidebarWidth}px - ${dockedAssistWidth}px);`;
-  }
-  if (isDockedView) {
-    return `max-width: calc(100% - ${dockedAssistWidth}px);`;
-  }
-  if (hasSidebar) {
-    return `max-width: calc(100% - ${sidebarWidth}px);`;
-  }
-  return 'max-width: 100%;';
-}
-
-export const HorizontalSplit = styled.div`
+export const ContentWrapper = styled.div`
   display: flex;
   flex-direction: column;
   flex: 1;
-  ${props => getWidth(props.hasSidebar, props.dockedView)}
   overflow-x: auto;
+  max-width: 100%;
 `;
 
-export const StyledIndicator = styled(HorizontalSplit)`
+export const StyledIndicator = styled(Flex)`
   align-items: center;
   justify-content: center;
+  position: absolute;
+  overflow: hidden;
+  top: 50%;
+  left: 50%;
 `;
 
-const Wrapper = styled(Box)<{ hasDockedElement: boolean }>`
+const Wrapper = styled(Box)`
   display: flex;
   height: 100vh;
   flex-direction: column;
-  width: ${p =>
-    p.hasDockedElement
-      ? `calc(100vw - ${p.theme.dockedAssistWidth}px)`
-      : '100vw'};
+  max-width: 100vw;
 `;

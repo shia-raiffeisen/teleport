@@ -19,6 +19,7 @@
 import React, { useState } from 'react';
 import { ButtonPrimary } from 'design/Button';
 import { NotificationItem } from 'shared/components/Notification';
+import { throttle } from 'shared/utils/highbar';
 
 import { TdpClient, TdpClientEvent } from 'teleport/lib/tdp';
 
@@ -53,9 +54,7 @@ const props: State = {
   username: 'user',
   clientOnWsOpen: () => {},
   clientOnWsClose: () => {},
-  wsConnection: 'closed',
-  disconnected: false,
-  setDisconnected: () => {},
+  wsConnection: { status: 'closed', statusText: 'websocket closed' },
   setClipboardSharingState: () => {},
   directorySharingState: {
     allowedByAcl: true,
@@ -64,11 +63,13 @@ const props: State = {
   },
   setDirectorySharingState: () => {},
   onShareDirectory: () => {},
+  onCtrlAltDel: () => {},
   clientOnPngFrame: () => {},
   clientOnBitmapFrame: () => {},
   clientOnClientScreenSpec: () => {},
   clientScreenSpecToRequest: { width: 0, height: 0 },
   clientOnTdpError: () => {},
+  clientOnTdpInfo: () => {},
   clientOnTdpWarning: () => {},
   canvasOnKeyDown: () => {},
   canvasOnKeyUp: () => {},
@@ -89,11 +90,12 @@ const props: State = {
   },
   showAnotherSessionActiveDialog: false,
   setShowAnotherSessionActiveDialog: () => {},
-  warnings: [],
-  onRemoveWarning: () => {},
+  alerts: [],
+  onRemoveAlert: () => {},
+  windowOnResize: throttle(() => {}, 1000),
 };
 
-export const Processing = () => (
+export const BothProcessing = () => (
   <DesktopSession
     {...props}
     fetchAttempt={{ status: 'processing' }}
@@ -104,8 +106,7 @@ export const Processing = () => (
       readState: 'granted',
       writeState: 'granted',
     }}
-    wsConnection={'open'}
-    disconnected={false}
+    wsConnection={{ status: 'open' }}
   />
 );
 
@@ -120,12 +121,11 @@ export const TdpProcessing = () => (
       readState: 'granted',
       writeState: 'granted',
     }}
-    wsConnection={'open'}
-    disconnected={false}
+    wsConnection={{ status: 'open' }}
   />
 );
 
-export const InvalidProcessingState = () => (
+export const FetchProcessing = () => (
   <DesktopSession
     {...props}
     fetchAttempt={{ status: 'processing' }}
@@ -136,8 +136,40 @@ export const InvalidProcessingState = () => (
       readState: 'granted',
       writeState: 'granted',
     }}
-    wsConnection={'open'}
-    disconnected={false}
+    wsConnection={{ status: 'open' }}
+  />
+);
+
+export const FetchError = () => (
+  <DesktopSession
+    {...props}
+    fetchAttempt={{ status: 'failed', statusText: 'some fetch  error' }}
+    tdpConnection={{ status: 'success' }}
+    wsConnection={{ status: 'open' }}
+  />
+);
+
+export const TdpError = () => (
+  <DesktopSession
+    {...props}
+    fetchAttempt={{ status: 'success' }}
+    tdpConnection={{
+      status: 'failed',
+      statusText: 'some tdp error',
+    }}
+    wsConnection={{ status: 'closed' }}
+  />
+);
+
+export const TdpGraceful = () => (
+  <DesktopSession
+    {...props}
+    fetchAttempt={{ status: 'success' }}
+    tdpConnection={{
+      status: '',
+      statusText: 'some tdp message',
+    }}
+    wsConnection={{ status: 'closed' }}
   />
 );
 
@@ -153,13 +185,17 @@ export const ConnectedSettingsFalse = () => {
       tdpClient={client}
       fetchAttempt={{ status: 'success' }}
       tdpConnection={{ status: 'success' }}
-      wsConnection={'open'}
-      disconnected={false}
+      wsConnection={{ status: 'open' }}
       clipboardSharingState={{
-        allowedByAcl: true,
-        browserSupported: true,
-        readState: 'granted',
-        writeState: 'granted',
+        allowedByAcl: false,
+        browserSupported: false,
+        readState: 'denied',
+        writeState: 'denied',
+      }}
+      directorySharingState={{
+        allowedByAcl: false,
+        browserSupported: false,
+        directorySelected: false,
       }}
       clientOnPngFrame={(ctx: CanvasRenderingContext2D) => {
         fillGray(ctx.canvas);
@@ -180,8 +216,7 @@ export const ConnectedSettingsTrue = () => {
       tdpClient={client}
       fetchAttempt={{ status: 'success' }}
       tdpConnection={{ status: 'success' }}
-      wsConnection={'open'}
-      disconnected={false}
+      wsConnection={{ status: 'open' }}
       clipboardSharingState={{
         allowedByAcl: true,
         browserSupported: true,
@@ -205,31 +240,7 @@ export const Disconnected = () => (
     {...props}
     fetchAttempt={{ status: 'success' }}
     tdpConnection={{ status: 'success' }}
-    wsConnection={'open'}
-    disconnected={true}
-  />
-);
-
-export const FetchError = () => (
-  <DesktopSession
-    {...props}
-    fetchAttempt={{ status: 'failed', statusText: 'some fetch  error' }}
-    tdpConnection={{ status: 'success' }}
-    wsConnection={'open'}
-    disconnected={false}
-  />
-);
-
-export const ConnectionError = () => (
-  <DesktopSession
-    {...props}
-    fetchAttempt={{ status: 'success' }}
-    tdpConnection={{
-      status: 'failed',
-      statusText: 'some connection error',
-    }}
-    wsConnection={'closed'}
-    disconnected={false}
+    wsConnection={{ status: 'closed', statusText: 'session disconnected' }}
   />
 );
 
@@ -238,8 +249,7 @@ export const UnintendedDisconnect = () => (
     {...props}
     fetchAttempt={{ status: 'success' }}
     tdpConnection={{ status: 'success' }}
-    disconnected={false}
-    wsConnection={'closed'}
+    wsConnection={{ status: 'closed' }}
   />
 );
 
@@ -254,8 +264,7 @@ export const WebAuthnPrompt = () => (
       readState: 'granted',
       writeState: 'granted',
     }}
-    wsConnection={'open'}
-    disconnected={false}
+    wsConnection={{ status: 'open' }}
     webauthn={{
       errorText: '',
       requested: true,
@@ -270,42 +279,89 @@ export const AnotherSessionActive = () => (
   <DesktopSession {...props} showAnotherSessionActiveDialog={true} />
 );
 
-export const Warnings = () => {
+export const ClipboardSharingDisabledRbac = () => (
+  <DesktopSession
+    {...props}
+    fetchAttempt={{ status: 'success' }}
+    tdpConnection={{ status: 'success' }}
+    wsConnection={{ status: 'open' }}
+    clipboardSharingState={{ browserSupported: true, allowedByAcl: false }}
+  />
+);
+
+export const ClipboardSharingDisabledIncompatibleBrowser = () => (
+  <DesktopSession
+    {...props}
+    fetchAttempt={{ status: 'success' }}
+    tdpConnection={{ status: 'success' }}
+    wsConnection={{ status: 'open' }}
+    clipboardSharingState={{ browserSupported: false, allowedByAcl: true }}
+  />
+);
+
+export const ClipboardSharingDisabledBrowserPermissions = () => (
+  <DesktopSession
+    {...props}
+    fetchAttempt={{ status: 'success' }}
+    tdpConnection={{ status: 'success' }}
+    wsConnection={{ status: 'open' }}
+    clipboardSharingState={{
+      browserSupported: true,
+      allowedByAcl: true,
+      readState: 'granted',
+      writeState: 'denied',
+    }}
+  />
+);
+
+export const Alerts = () => {
   const client = fakeClient();
   client.connect = async () => {
     client.emit(TdpClientEvent.TDP_PNG_FRAME);
   };
 
-  const [warnings, setWarnings] = useState<NotificationItem[]>([]);
+  const [alerts, setAlerts] = useState<NotificationItem[]>([]);
 
   const addWarning = () => {
-    setWarnings(prevItems => [
+    setAlerts(prevItems => [
       ...prevItems,
       {
         id: crypto.randomUUID(),
         severity: 'warn',
-        content:
-          "Lorem Ipsum is simply dummy text of the printing and typesetting industry. Lorem Ipsum has been the industry's standard dummy text ever since the 1500s.",
+        content: `This is a warning message at ${new Date().toLocaleTimeString()}`,
       },
     ]);
   };
 
-  const removeWarning = (id: string) => {
-    setWarnings(prevState => prevState.filter(warning => warning.id !== id));
+  const addInfo = () => {
+    setAlerts(prevItems => [
+      ...prevItems,
+      {
+        id: crypto.randomUUID(),
+        severity: 'info',
+        content: `This is an info message at ${new Date().toLocaleTimeString()}`,
+      },
+    ]);
+  };
+
+  const removeAlert = (id: string) => {
+    setAlerts(prevState => prevState.filter(warning => warning.id !== id));
   };
 
   return (
     <>
-      <ButtonPrimary onClick={addWarning} mb={1}>
+      <ButtonPrimary onClick={addWarning} mb={1} mr={1}>
         Add Warning
+      </ButtonPrimary>
+      <ButtonPrimary onClick={addInfo} mb={1}>
+        Add Info
       </ButtonPrimary>
       <DesktopSession
         {...props}
         tdpClient={client}
         fetchAttempt={{ status: 'success' }}
         tdpConnection={{ status: 'success' }}
-        wsConnection={'open'}
-        disconnected={false}
+        wsConnection={{ status: 'open' }}
         clipboardSharingState={{
           allowedByAcl: true,
           browserSupported: true,
@@ -320,8 +376,8 @@ export const Warnings = () => {
         clientOnPngFrame={(ctx: CanvasRenderingContext2D) => {
           fillGray(ctx.canvas);
         }}
-        warnings={warnings}
-        onRemoveWarning={removeWarning}
+        alerts={alerts}
+        onRemoveAlert={removeAlert}
       />
     </>
   );

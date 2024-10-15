@@ -25,6 +25,7 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/accesslist"
 	"github.com/gravitational/teleport/lib/backend"
@@ -54,12 +55,12 @@ type AccessListService struct {
 // NewAccessListService creates a new AccessListService. This is a simple, cache focused
 // backend service that doesn't perform any of the validation that the main backend service
 // does.
-func NewAccessListService(backend backend.Backend) (*AccessListService, error) {
+func NewAccessListService(b backend.Backend) (*AccessListService, error) {
 	service, err := generic.NewService(&generic.ServiceConfig[*accesslist.AccessList]{
-		Backend:       backend,
+		Backend:       b,
 		PageLimit:     accessListMaxPageSize,
 		ResourceKind:  types.KindAccessList,
-		BackendPrefix: accessListPrefix,
+		BackendPrefix: backend.NewKey(accessListPrefix),
 		MarshalFunc:   services.MarshalAccessList,
 		UnmarshalFunc: services.UnmarshalAccessList,
 	})
@@ -68,10 +69,10 @@ func NewAccessListService(backend backend.Backend) (*AccessListService, error) {
 	}
 
 	memberService, err := generic.NewService(&generic.ServiceConfig[*accesslist.AccessListMember]{
-		Backend:       backend,
+		Backend:       b,
 		PageLimit:     accessListMemberMaxPageSize,
 		ResourceKind:  types.KindAccessListMember,
-		BackendPrefix: accessListMemberPrefix,
+		BackendPrefix: backend.NewKey(accessListMemberPrefix),
 		MarshalFunc:   services.MarshalAccessListMember,
 		UnmarshalFunc: services.UnmarshalAccessListMember,
 	})
@@ -80,10 +81,10 @@ func NewAccessListService(backend backend.Backend) (*AccessListService, error) {
 	}
 
 	reviewService, err := generic.NewService(&generic.ServiceConfig[*accesslist.Review]{
-		Backend:       backend,
+		Backend:       b,
 		PageLimit:     accessListReviewMaxPageSize,
 		ResourceKind:  types.KindAccessListReview,
-		BackendPrefix: accessListReviewPrefix,
+		BackendPrefix: backend.NewKey(accessListReviewPrefix),
 		MarshalFunc:   services.MarshalAccessListReview,
 		UnmarshalFunc: services.UnmarshalAccessListReview,
 	})
@@ -92,7 +93,7 @@ func NewAccessListService(backend backend.Backend) (*AccessListService, error) {
 	}
 
 	return &AccessListService{
-		log:           logrus.WithFields(logrus.Fields{trace.Component: "access-list:simple-service"}),
+		log:           logrus.WithFields(logrus.Fields{teleport.ComponentKey: "access-list:simple-service"}),
 		service:       service,
 		memberService: memberService,
 		reviewService: reviewService,
@@ -130,27 +131,19 @@ func (a *AccessListService) DeleteAllAccessLists(ctx context.Context) error {
 	return trace.Wrap(a.service.DeleteAllResources(ctx))
 }
 
+// CountAccessListMembers will count all access list members.
+func (a *AccessListService) CountAccessListMembers(ctx context.Context, accessListName string) (uint32, error) {
+	count, err := a.memberService.WithPrefix(accessListName).CountResources(ctx)
+	return uint32(count), trace.Wrap(err)
+}
+
 // ListAccessListMembers returns a paginated list of all access list members.
 func (a *AccessListService) ListAccessListMembers(ctx context.Context, accessListName string, pageSize int, nextToken string) ([]*accesslist.AccessListMember, string, error) {
-	// We'll make a best effort to determine if the access list is implicit, but will proceed if we can't figure it out.
-	al, err := a.GetAccessList(ctx, accessListName)
-	if err == nil {
-		if al.HasImplicitMembership() {
-			return nil, "", trace.Wrap(services.ImplicitAccessListError{})
-		}
-	}
 	return a.memberService.WithPrefix(accessListName).ListResources(ctx, pageSize, nextToken)
 }
 
 // GetAccessListMember returns the specified access list member resource.
 func (a *AccessListService) GetAccessListMember(ctx context.Context, accessListName string, memberName string) (*accesslist.AccessListMember, error) {
-	// We'll make a best effort to determine if the access list is implicit, but will proceed if we can't figure it out.
-	al, err := a.GetAccessList(ctx, accessListName)
-	if err == nil {
-		if al.HasImplicitMembership() {
-			return nil, trace.Wrap(services.ImplicitAccessListError{})
-		}
-	}
 	return a.memberService.WithPrefix(accessListName).GetResource(ctx, memberName)
 }
 
@@ -189,4 +182,10 @@ func (a *AccessListService) DeleteAccessListReview(ctx context.Context, accessLi
 // DeleteAllAccessListReviews will delete all access list reviews from the backend.
 func (a *AccessListService) DeleteAllAccessListReviews(ctx context.Context) error {
 	return trace.Wrap(a.reviewService.DeleteAllResources(ctx))
+}
+
+// ListAllAccessListMembers returns a paginated list of all access list members for all access lists.
+func (a *AccessListService) ListAllAccessListMembers(ctx context.Context, pageSize int, pageToken string) ([]*accesslist.AccessListMember, string, error) {
+	members, nextToken, err := a.memberService.ListResources(ctx, pageSize, pageToken)
+	return members, nextToken, trace.Wrap(err)
 }

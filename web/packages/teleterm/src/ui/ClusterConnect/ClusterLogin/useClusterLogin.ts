@@ -22,70 +22,56 @@ import { useAsync } from 'shared/hooks/useAsync';
 import { useAppContext } from 'teleterm/ui/appContextProvider';
 import { assertUnreachable } from 'teleterm/ui/utils';
 import { RootClusterUri } from 'teleterm/ui/uri';
+import { cloneAbortSignal } from 'teleterm/services/tshd/cloneableClient';
 
 import type * as types from 'teleterm/ui/services/clusters/types';
-import type * as tsh from 'teleterm/services/tshd/types';
 
 export default function useClusterLogin(props: Props) {
   const { onSuccess, clusterUri } = props;
   const { clustersService } = useAppContext();
   const cluster = clustersService.findCluster(clusterUri);
-  const refAbortCtrl = useRef<tsh.TshAbortController>(null);
+  const refAbortCtrl = useRef<AbortController>(null);
   const loggedInUserName =
     props.prefill.username || cluster.loggedInUser?.name || null;
   const [shouldPromptSsoStatus, promptSsoStatus] = useState(false);
   const [webauthnLogin, setWebauthnLogin] = useState<WebauthnLogin>();
 
   const [initAttempt, init] = useAsync(async () => {
-    const authSettings = await clustersService.getAuthSettings(clusterUri);
-
-    if (authSettings.preferredMfa === 'u2f') {
-      throw new Error(`the U2F API for hardware keys is deprecated, \
-        please notify your system administrator to update cluster \
-        settings to use WebAuthn as the second factor protocol.`);
-    }
-
-    return authSettings;
+    return await clustersService.getAuthSettings(clusterUri);
   });
 
   const [loginAttempt, login, setAttempt] = useAsync(
     (params: types.LoginParams) => {
-      refAbortCtrl.current = clustersService.client.createAbortController();
+      refAbortCtrl.current = new AbortController();
       switch (params.kind) {
         case 'local':
           return clustersService.loginLocal(
             params,
-            refAbortCtrl.current.signal
+            cloneAbortSignal(refAbortCtrl.current.signal)
           );
         case 'passwordless':
           return clustersService.loginPasswordless(
             params,
-            refAbortCtrl.current.signal
+            cloneAbortSignal(refAbortCtrl.current.signal)
           );
         case 'sso':
-          return clustersService.loginSso(params, refAbortCtrl.current.signal);
+          return clustersService.loginSso(
+            params,
+            cloneAbortSignal(refAbortCtrl.current.signal)
+          );
         default:
           assertUnreachable(params);
       }
     }
   );
 
-  const onLoginWithLocal = (
-    username: string,
-    password: string,
-    token: string,
-    secondFactor?: types.Auth2faType
-  ) => {
-    if (secondFactor === 'webauthn') {
-      setWebauthnLogin({ prompt: 'tap' });
-    }
-
+  const onLoginWithLocal = (username: string, password: string) => {
+    setWebauthnLogin({ prompt: 'tap' });
     login({
       kind: 'local',
       clusterUri,
       username,
       password,
-      token,
     });
   };
 
@@ -181,6 +167,7 @@ export default function useClusterLogin(props: Props) {
     onAbort,
     loginAttempt,
     initAttempt,
+    init,
     clearLoginAttempt,
   };
 }

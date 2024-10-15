@@ -18,7 +18,7 @@
 
 import React from 'react';
 import * as Alerts from 'design/Alert';
-import { ButtonIcon, Text, Indicator, Box } from 'design';
+import { ButtonIcon, Text, Indicator, Box, H2, ButtonPrimary } from 'design';
 import * as Icons from 'design/Icon';
 import { DialogHeader, DialogContent } from 'design/Dialog';
 import { PrimaryAuthType } from 'shared/services';
@@ -43,6 +43,7 @@ export type ClusterLoginPresentationProps = State & {
 export function ClusterLoginPresentation({
   title,
   initAttempt,
+  init,
   loginAttempt,
   clearLoginAttempt,
   onLoginWithLocal,
@@ -58,9 +59,9 @@ export function ClusterLoginPresentation({
   return (
     <>
       <DialogHeader px={4} pt={4} mb={0}>
-        <Text typography="h4">
+        <H2>
           Login to <b>{title}</b>
-        </Text>
+        </H2>
         <ButtonIcon ml="auto" p={3} onClick={onCloseDialog} aria-label="Close">
           <Icons.Cross size="medium" />
         </ButtonIcon>
@@ -69,10 +70,12 @@ export function ClusterLoginPresentation({
         {reason && <Reason reason={reason} />}
 
         {initAttempt.status === 'error' && (
-          <Alerts.Danger m={4}>
-            Unable to retrieve cluster auth preferences,{' '}
-            {initAttempt.statusText}
-          </Alerts.Danger>
+          <Box m={4}>
+            <Alerts.Danger details={initAttempt.statusText}>
+              Unable to retrieve cluster auth preferences
+            </Alerts.Danger>
+            <ButtonPrimary onClick={init}>Retry</ButtonPrimary>
+          </Box>
         )}
         {initAttempt.status === 'processing' && (
           <Box textAlign="center" m={4}>
@@ -113,12 +116,22 @@ function getPrimaryAuthType(auth: AuthSettings): PrimaryAuthType {
 }
 
 function Reason({ reason }: { reason: ClusterConnectReason }) {
+  const $targetDesc = getTargetDesc(reason);
+
+  return (
+    <Text px={4} pt={2} mb={0}>
+      You tried to connect to {$targetDesc} but your session has expired. Please
+      log in to refresh the session.
+    </Text>
+  );
+}
+
+const getTargetDesc = (reason: ClusterConnectReason): React.ReactNode => {
   switch (reason.kind) {
     case 'reason.gateway-cert-expired': {
       const { gateway, targetUri } = reason;
-      let $targetDesc: React.ReactNode;
       if (gateway) {
-        $targetDesc = (
+        return (
           <>
             <strong>{gateway.targetName}</strong>
             {gateway.targetUser && (
@@ -130,18 +143,15 @@ function Reason({ reason }: { reason: ClusterConnectReason }) {
           </>
         );
       } else {
-        $targetDesc = <strong>{getTargetNameFromUri(targetUri)}</strong>;
+        return <strong>{getTargetNameFromUri(targetUri)}</strong>;
       }
-
-      return (
-        <Text px={4} pt={2} mb={0}>
-          You tried to connect to {$targetDesc} but your session has expired.
-          Please log in to refresh the session.
-        </Text>
-      );
+    }
+    case 'reason.vnet-cert-expired': {
+      return <strong>{reason.publicAddr}</strong>;
     }
     default: {
+      reason satisfies never;
       return;
     }
   }
-}
+};

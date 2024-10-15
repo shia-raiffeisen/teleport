@@ -21,6 +21,7 @@ package kubev1
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"testing"
 
@@ -37,12 +38,15 @@ import (
 	proto "github.com/gravitational/teleport/api/gen/proto/go/teleport/kube/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	kubeproxy "github.com/gravitational/teleport/lib/kube/proxy"
 	testingkubemock "github.com/gravitational/teleport/lib/kube/proxy/testing/kube_server"
 	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/modules"
 )
 
 func TestListKubernetesResources(t *testing.T) {
+	modules.SetInsecureTestMode(true)
 	var (
 		usernameWithFullAccess = "full_user"
 		usernameNoAccess       = "limited_user"
@@ -536,10 +540,20 @@ func initGRPCServer(t *testing.T, testCtx *kubeproxy.TestContext, listener net.L
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, proxyAuthClient.Close()) })
 
+	proxyTLSConfig, err := serverIdentity.TLSConfig(nil)
+	require.NoError(t, err)
+	require.Len(t, proxyTLSConfig.Certificates, 1)
+	require.NotNil(t, proxyTLSConfig.RootCAs)
+
 	server, err := New(
 		Config{
-			ClusterName:   testCtx.ClusterName,
-			Signer:        proxyAuthClient,
+			ClusterName: testCtx.ClusterName,
+			GetConnTLSCertificate: func() (*tls.Certificate, error) {
+				return &proxyTLSConfig.Certificates[0], nil
+			},
+			GetConnTLSRoots: func() (*x509.CertPool, error) {
+				return proxyTLSConfig.RootCAs, nil
+			},
 			AccessPoint:   proxyAuthClient,
 			Emitter:       testCtx.Emitter,
 			KubeProxyAddr: testCtx.KubeProxyAddress(),
@@ -562,7 +576,7 @@ func initGRPCServer(t *testing.T, testCtx *kubeproxy.TestContext, listener net.L
 
 // copyAndConfigureTLS can be used to copy and modify an existing *tls.Config
 // for Teleport application proxy servers.
-func copyAndConfigureTLS(config *tls.Config, log logrus.FieldLogger, accessPoint auth.AccessCache, clusterName string) *tls.Config {
+func copyAndConfigureTLS(config *tls.Config, log logrus.FieldLogger, accessPoint authclient.AccessCache, clusterName string) *tls.Config {
 	tlsConfig := config.Clone()
 
 	// Require clients to present a certificate
@@ -572,7 +586,7 @@ func copyAndConfigureTLS(config *tls.Config, log logrus.FieldLogger, accessPoint
 	// client's certificate to verify the chain presented. If the client does not
 	// pass in the cluster name, this functions pulls back all CA to try and
 	// match the certificate presented against any CA.
-	tlsConfig.GetConfigForClient = auth.WithClusterCAs(tlsConfig.Clone(), accessPoint, clusterName, log)
+	tlsConfig.GetConfigForClient = authclient.WithClusterCAs(tlsConfig.Clone(), accessPoint, clusterName, log)
 
 	return tlsConfig
 }

@@ -16,7 +16,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-package main
+package crdgen
 
 import (
 	"fmt"
@@ -76,8 +76,9 @@ type SchemaVersion struct {
 	// Teleport resource, this is equal to the Teleport resource Version for
 	// compatibility purposes. For multi-version resource, the value is always
 	// "v1" as the version is already in the CR kind.
-	Version string
-	Schema  *Schema
+	Version           string
+	Schema            *Schema
+	additionalColumns []apiextv1.CustomResourceColumnDefinition
 }
 
 // Schema is a set of object properties.
@@ -109,9 +110,11 @@ func NewSchema() *Schema {
 }
 
 type resourceSchemaConfig struct {
+	nameOverride        string
 	versionOverride     string
 	customSpecFields    []string
 	kindContainsVersion bool
+	additionalColumns   []apiextv1.CustomResourceColumnDefinition
 }
 
 type resourceSchemaOption func(*resourceSchemaConfig)
@@ -119,6 +122,12 @@ type resourceSchemaOption func(*resourceSchemaConfig)
 func withVersionOverride(version string) resourceSchemaOption {
 	return func(cfg *resourceSchemaConfig) {
 		cfg.versionOverride = version
+	}
+}
+
+func withNameOverride(name string) resourceSchemaOption {
+	return func(cfg *resourceSchemaConfig) {
+		cfg.nameOverride = name
 	}
 }
 
@@ -135,6 +144,24 @@ func withCustomSpecFields(customSpecFields []string) resourceSchemaOption {
 	}
 }
 
+var ageColumn = apiextv1.CustomResourceColumnDefinition{
+	Name:        "Age",
+	Type:        "date",
+	Description: "The age of this resource",
+	JSONPath:    ".metadata.creationTimestamp",
+}
+
+func withAdditionalColumns(additionalColumns []apiextv1.CustomResourceColumnDefinition) resourceSchemaOption {
+	// We add the age column back (it's removed if we set additional columns for the CRD).
+	// See https://github.com/kubernetes/kubectl/issues/903#issuecomment-669244656.
+	columns := make([]apiextv1.CustomResourceColumnDefinition, len(additionalColumns)+1)
+	copy(columns, additionalColumns)
+	columns[len(additionalColumns)] = ageColumn
+
+	return func(cfg *resourceSchemaConfig) {
+		cfg.additionalColumns = columns
+	}
+}
 func (generator *SchemaGenerator) addResource(file *File, name string, opts ...resourceSchemaOption) error {
 	var cfg resourceSchemaConfig
 	for _, opt := range opts {
@@ -190,6 +217,9 @@ func (generator *SchemaGenerator) addResource(file *File, name string, opts ...r
 	if cfg.versionOverride != "" {
 		resourceVersion = cfg.versionOverride
 	}
+	if cfg.nameOverride != "" {
+		resourceKind = cfg.nameOverride
+	}
 	kubernetesKind := resourceKind
 	if cfg.kindContainsVersion {
 		kubernetesKind = resourceKind + strings.ToUpper(resourceVersion)
@@ -221,8 +251,9 @@ func (generator *SchemaGenerator) addResource(file *File, name string, opts ...r
 		kubernetesVersion = "v1"
 	}
 	root.versions = append(root.versions, SchemaVersion{
-		Version: kubernetesVersion,
-		Schema:  schema,
+		Version:           kubernetesVersion,
+		Schema:            schema,
+		additionalColumns: cfg.additionalColumns,
 	})
 
 	return nil
@@ -249,6 +280,7 @@ func (generator *SchemaGenerator) traverseInner(message *Message) (*Schema, erro
 	generator.memo[name] = schema
 
 	for _, field := range message.Fields {
+		// Skip the ignored fields
 		if _, ok := ignoredFields[message.Name()][field.Name()]; ok {
 			continue
 		}
@@ -265,11 +297,17 @@ func (generator *SchemaGenerator) traverseInner(message *Message) (*Schema, erro
 			continue
 		}
 
-		var err error
-		schema.Properties[jsonName], err = generator.prop(field)
+		prop, err := generator.prop(field)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
+
+		// If the field has custom additional description, we append it.
+		if desc, ok := additionalDescription[message.Name()][field.Name()]; ok {
+			prop.Description = prop.Description + " " + desc
+		}
+
+		schema.Properties[jsonName] = prop
 	}
 	schema.built = true
 
@@ -503,6 +541,7 @@ func (root RootSchema) CustomResourceDefinition() (apiextv1.CustomResourceDefini
 					},
 				},
 			},
+			AdditionalPrinterColumns: schemaVersion.additionalColumns,
 		})
 	}
 	return crd, nil

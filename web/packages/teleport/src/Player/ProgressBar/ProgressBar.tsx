@@ -178,7 +178,7 @@ const ActionButton = styled.button`
   }
 `;
 
-const StyledProgessBar = styled.div`
+const StyledProgessBar = styled.div<{ disabled?: boolean }>`
   background: ${props => props.theme.colors.levels.surface};
   display: flex;
   color: ${props => props.theme.colors.text.main};
@@ -203,7 +203,9 @@ const StyledProgessBar = styled.div`
         : props.theme.colors.success.main};
 
     border-radius: 200px;
-    box-shadow: 0 0 4px rgba(0, 0, 0, 0.12), 0 4px 4px rgba(0, 0, 0, 0.24);
+    box-shadow:
+      0 0 4px rgba(0, 0, 0, 0.12),
+      0 4px 4px rgba(0, 0, 0, 0.24);
     width: 16px;
     height: 16px;
     left: -8px;

@@ -35,10 +35,11 @@ import (
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/cloud"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/httplib"
+	"github.com/gravitational/teleport/lib/inventory"
 	"github.com/gravitational/teleport/lib/labels"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/multiplexer"
@@ -46,7 +47,6 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/srv/ingress"
-	"github.com/gravitational/teleport/lib/utils"
 )
 
 // TLSServerConfig is a configuration for TLS server
@@ -58,7 +58,7 @@ type TLSServerConfig struct {
 	// LimiterConfig is limiter config
 	LimiterConfig limiter.Config
 	// AccessPoint is caching access point
-	AccessPoint auth.ReadKubernetesAccessPoint
+	AccessPoint authclient.ReadKubernetesAccessPoint
 	// OnHeartbeat is a callback for kubernetes_service heartbeats.
 	OnHeartbeat func(error)
 	// GetRotation returns the certificate rotation state.
@@ -101,6 +101,8 @@ type TLSServerConfig struct {
 	KubernetesServersWatcher *services.KubeServerWatcher
 	// PROXYProtocolMode controls behavior related to unsigned PROXY protocol headers.
 	PROXYProtocolMode multiplexer.PROXYProtocolMode
+	// InventoryHandle is used to send kube server heartbeats via the inventory control stream.
+	InventoryHandle inventory.DownstreamHandle
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -111,18 +113,11 @@ func (c *TLSServerConfig) CheckAndSetDefaults() error {
 	if c.TLS == nil {
 		return trace.BadParameter("missing parameter TLS")
 	}
-	c.TLS.ClientAuth = tls.RequireAndVerifyClientCert
-	if c.TLS.ClientCAs == nil {
-		return trace.BadParameter("missing parameter TLS.ClientCAs")
-	}
-	if c.TLS.RootCAs == nil {
-		return trace.BadParameter("missing parameter TLS.RootCAs")
-	}
-	if len(c.TLS.Certificates) == 0 {
-		return trace.BadParameter("missing parameter TLS.Certificates")
-	}
 	if c.AccessPoint == nil {
 		return trace.BadParameter("missing parameter AccessPoint")
+	}
+	if c.InventoryHandle == nil {
+		return trace.BadParameter("missing parameter InventoryHandle")
 	}
 
 	if err := c.validateLabelKeys(); err != nil {
@@ -171,7 +166,7 @@ type TLSServer struct {
 	fwd          *Forwarder
 	mu           sync.Mutex
 	listener     net.Listener
-	heartbeats   map[string]*srv.Heartbeat
+	heartbeats   map[string]*srv.HeartbeatV2
 	closeContext context.Context
 	closeFunc    context.CancelFunc
 	// kubeClusterWatcher monitors changes to kube cluster resources.
@@ -192,7 +187,7 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 		return nil, trace.Wrap(err)
 	}
 	log := cfg.Log.WithFields(logrus.Fields{
-		trace.Component: cfg.Component,
+		teleport.ComponentKey: cfg.Component,
 	})
 	// limiter limits requests by frequency and amount of simultaneous
 	// connections per client
@@ -254,7 +249,7 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 				return authz.ContextWithClientAddrs(ctx, c.RemoteAddr(), c.LocalAddr())
 			},
 		},
-		heartbeats: make(map[string]*srv.Heartbeat),
+		heartbeats: make(map[string]*srv.HeartbeatV2),
 		monitoredKubeClusters: monitoredKubeClusters{
 			static: fwd.kubeClusters(),
 		},
@@ -317,6 +312,14 @@ func (t *TLSServer) Serve(listener net.Listener, options ...ServeOption) error {
 	defer mux.Close()
 
 	t.mu.Lock()
+	select {
+	// If the server is closed before the listener is started, return early
+	// to avoid deadlock.
+	case <-t.closeContext.Done():
+		t.mu.Unlock()
+		return nil
+	default:
+	}
 	t.listener = mux.TLS()
 	err = http2.ConfigureServer(t.Server, &http2.Server{})
 	t.mu.Unlock()
@@ -404,8 +407,11 @@ func (t *TLSServer) close(ctx context.Context) error {
 		t.KubernetesServersWatcher.Close()
 	}
 
+	var listClose error
 	t.mu.Lock()
-	listClose := t.listener.Close()
+	if t.listener != nil {
+		listClose = t.listener.Close()
+	}
 	t.mu.Unlock()
 	return trace.NewAggregate(append(errs, listClose)...)
 }
@@ -414,20 +420,12 @@ func (t *TLSServer) close(ctx context.Context) error {
 // and server's GetConfigForClient reloads the list of trusted
 // local and remote certificate authorities
 func (t *TLSServer) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, error) {
-	return auth.WithClusterCAs(t.TLS, t.AccessPoint, t.ClusterName, t.log)(info)
-}
-
-// getServerInfoFunc returns function that the heartbeater uses to report the
-// provided cluster to the auth server.
-func (t *TLSServer) getServerInfoFunc(name string) func() (types.Resource, error) {
-	return func() (types.Resource, error) {
-		return t.getServerInfo(name)
-	}
+	return authclient.WithClusterCAs(t.TLS, t.AccessPoint, t.ClusterName, t.log)(info)
 }
 
 // GetServerInfo returns a services.Server object for heartbeats (aka
 // presence).
-func (t *TLSServer) getServerInfo(name string) (types.Resource, error) {
+func (t *TLSServer) getServerInfo(name string) (*types.KubernetesServerV3, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var addr string
@@ -501,18 +499,11 @@ func (t *TLSServer) getKubeClusterWithServiceLabels(name string) (*types.Kuberne
 }
 
 // startHeartbeat starts the registration heartbeat to the auth server.
-func (t *TLSServer) startHeartbeat(ctx context.Context, name string) error {
-	heartbeat, err := srv.NewHeartbeat(srv.HeartbeatConfig{
-		Mode:            srv.HeartbeatModeKube,
-		Context:         t.closeContext,
-		Component:       t.TLSServerConfig.Component,
+func (t *TLSServer) startHeartbeat(name string) error {
+	heartbeat, err := srv.NewKubernetesServerHeartbeat(srv.HeartbeatV2Config[*types.KubernetesServerV3]{
+		InventoryHandle: t.InventoryHandle,
 		Announcer:       t.TLSServerConfig.AuthClient,
-		GetServerInfo:   t.getServerInfoFunc(name),
-		KeepAlivePeriod: apidefaults.ServerKeepAliveTTL(),
-		AnnouncePeriod:  apidefaults.ServerAnnounceTTL/2 + utils.RandomDuration(apidefaults.ServerAnnounceTTL/10),
-		ServerTTL:       apidefaults.ServerAnnounceTTL,
-		CheckPeriod:     defaults.HeartbeatCheckPeriod,
-		Clock:           t.TLSServerConfig.Clock,
+		GetResource:     func(context.Context) (*types.KubernetesServerV3, error) { return t.getServerInfo(name) },
 		OnHeartbeat:     t.TLSServerConfig.OnHeartbeat,
 	})
 	if err != nil {
@@ -547,7 +538,7 @@ func (t *TLSServer) startStaticClustersHeartbeat() error {
 		t.KubeServiceType == LegacyProxyService {
 		t.log.Debugf("Starting kubernetes_service heartbeats for %q", t.Component)
 		for _, cluster := range t.fwd.kubeClusters() {
-			if err := t.startHeartbeat(t.closeContext, cluster.GetName()); err != nil {
+			if err := t.startHeartbeat(cluster.GetName()); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -582,7 +573,7 @@ func (t *TLSServer) getServiceStaticLabels() map[string]string {
 	return labels
 }
 
-// setServiceLabels updates the the cluster labels with the kubernetes_service labels.
+// setServiceLabels updates the cluster labels with the kubernetes_service labels.
 // If the cluster and the service define overlapping labels the service labels take precedence.
 // This function manipulates the original cluster.
 func (t *TLSServer) setServiceLabels(cluster types.KubeCluster) {

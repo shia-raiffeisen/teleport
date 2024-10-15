@@ -29,6 +29,7 @@ import (
 
 	"github.com/go-webauthn/webauthn/protocol"
 	wan "github.com/go-webauthn/webauthn/webauthn"
+	gogotypes "github.com/gogo/protobuf/types"
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
 
@@ -76,13 +77,14 @@ func (f *loginFlow) begin(ctx context.Context, user string, challengeExtensions 
 		return nil, trace.BadParameter("mfa challenges with scope %s cannot allow reuse", challengeExtensions.Scope)
 	}
 
-	passwordless := challengeExtensions.Scope == mfav1.ChallengeScope_CHALLENGE_SCOPE_PASSWORDLESS_LOGIN
-	if user == "" && !passwordless {
+	// discoverableLogin identifies logins started with an unknown/empty user.
+	discoverableLogin := challengeExtensions.Scope == mfav1.ChallengeScope_CHALLENGE_SCOPE_PASSWORDLESS_LOGIN
+	if user == "" && !discoverableLogin {
 		return nil, trace.BadParameter("user required")
 	}
 
 	var u *webUser
-	if passwordless {
+	if discoverableLogin {
 		u = &webUser{} // Issue anonymous challenge.
 	} else {
 		webID, err := f.getWebID(ctx, user)
@@ -129,7 +131,12 @@ func (f *loginFlow) begin(ctx context.Context, user string, challengeExtensions 
 			return !resident1 && resident2
 		})
 
-		u = newWebUser(user, webID, true /* credentialIDOnly */, devices)
+		u = newWebUser(webUserOpts{
+			name:             user,
+			webID:            webID,
+			devices:          devices,
+			credentialIDOnly: true,
+		})
 
 		// Let's make sure we have at least one registered credential here, since we
 		// have to allow zero credentials for passwordless below.
@@ -149,12 +156,19 @@ func (f *loginFlow) begin(ctx context.Context, user string, challengeExtensions 
 			wantypes.AppIDExtension: f.U2F.AppID,
 		}))
 	}
+	// Set the user verification requirement, if present, only for
+	// non-discoverable logins.
+	// For discoverable logins we rely on the wan.WebAuthn default set below.
+	if !discoverableLogin && challengeExtensions.UserVerificationRequirement != "" {
+		uvr := protocol.UserVerificationRequirement(challengeExtensions.UserVerificationRequirement)
+		opts = append(opts, wan.WithUserVerification(uvr))
+	}
 
 	// Create the WebAuthn object and issue a new challenge.
 	web, err := newWebAuthn(webAuthnParams{
 		cfg:                     f.Webauthn,
 		rpID:                    f.Webauthn.RPID,
-		requireUserVerification: passwordless,
+		requireUserVerification: discoverableLogin,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -162,7 +176,7 @@ func (f *loginFlow) begin(ctx context.Context, user string, challengeExtensions 
 
 	var assertion *protocol.CredentialAssertion
 	var sessionData *wan.SessionData
-	if passwordless {
+	if discoverableLogin {
 		assertion, sessionData, err = web.BeginDiscoverableLogin(opts...)
 	} else {
 		assertion, sessionData, err = web.BeginLogin(u, opts...)
@@ -212,10 +226,10 @@ func (f *loginFlow) finish(ctx context.Context, user string, resp *wantypes.Cred
 		return nil, trace.BadParameter("requested challenge extensions must be supplied.")
 	}
 
-	passwordless := requiredExtensions.Scope == mfav1.ChallengeScope_CHALLENGE_SCOPE_PASSWORDLESS_LOGIN
+	discoverableLogin := requiredExtensions.Scope == mfav1.ChallengeScope_CHALLENGE_SCOPE_PASSWORDLESS_LOGIN
 
 	switch {
-	case user == "" && !passwordless:
+	case user == "" && !discoverableLogin:
 		return nil, trace.BadParameter("user required")
 	case resp == nil:
 		// resp != nil is good enough to proceed, we leave remaining validations to
@@ -235,7 +249,7 @@ func (f *loginFlow) finish(ctx context.Context, user string, resp *wantypes.Cred
 	}
 
 	var webID []byte
-	if passwordless {
+	if discoverableLogin {
 		webID = parsedResp.Response.UserHandle
 		if len(webID) == 0 {
 			return nil, trace.BadParameter("webauthn user handle required for passwordless")
@@ -277,7 +291,15 @@ func (f *loginFlow) finish(ctx context.Context, user string, resp *wantypes.Cred
 	case dev.GetU2F() != nil:
 		rpID = f.U2F.AppID
 	}
-	u := newWebUser(user, webID, false /* credentialIDOnly */, []*types.MFADevice{dev})
+	u := newWebUser(webUserOpts{
+		name:    user,
+		webID:   webID,
+		devices: []*types.MFADevice{dev},
+		currentFlags: &credentialFlags{
+			BE: parsedResp.Response.AuthenticatorData.Flags.HasBackupEligible(),
+			BS: parsedResp.Response.AuthenticatorData.Flags.HasBackupState(),
+		},
+	})
 
 	// Fetch the previously-stored SessionData, so it's checked against the user
 	// response.
@@ -289,16 +311,23 @@ func (f *loginFlow) finish(ctx context.Context, user string, resp *wantypes.Cred
 
 	// Check if the given scope is satisfied by the challenge scope.
 	if requiredExtensions.Scope != sd.ChallengeExtensions.Scope && requiredExtensions.Scope != mfav1.ChallengeScope_CHALLENGE_SCOPE_UNSPECIFIED {
-		// old clients do not yet provide a scope, so we only enforce scope opportunistically.
-		// TODO(Joerger): DELETE IN v16.0.0
-		if sd.ChallengeExtensions.Scope != mfav1.ChallengeScope_CHALLENGE_SCOPE_UNSPECIFIED {
-			return nil, trace.AccessDenied("required scope %q is not satisfied by the given webauthn session with scope %q", requiredExtensions.Scope, sd.ChallengeExtensions.Scope)
-		}
+		return nil, trace.AccessDenied("required scope %q is not satisfied by the given webauthn session with scope %q", requiredExtensions.Scope, sd.ChallengeExtensions.Scope)
 	}
 
 	// If this session is reusable, but this login forbids reusable sessions, return an error.
 	if requiredExtensions.AllowReuse == mfav1.ChallengeAllowReuse_CHALLENGE_ALLOW_REUSE_NO && sd.ChallengeExtensions.AllowReuse == mfav1.ChallengeAllowReuse_CHALLENGE_ALLOW_REUSE_YES {
 		return nil, trace.AccessDenied("the given webauthn session allows reuse, but reuse is not permitted in this context")
+	}
+
+	// Verify (and possibly correct) the user verification requirement.
+	// A mismatch here could indicate a programming error or even foul play.
+	uvr := protocol.UserVerificationRequirement(requiredExtensions.UserVerificationRequirement)
+	if (discoverableLogin || uvr == protocol.VerificationRequired) && sd.UserVerification != string(protocol.VerificationRequired) {
+		// This is not a failure yet, but will likely become one.
+		sd.UserVerification = string(protocol.VerificationRequired)
+		log.Warnf(""+
+			"WebAuthn: User verification required by extensions but not by challenge. "+
+			"Increased SessionData.UserVerification to %s.", sd.UserVerification)
 	}
 
 	sessionData := wantypes.SessionDataToProtocol(sd)
@@ -320,14 +349,14 @@ func (f *loginFlow) finish(ctx context.Context, user string, resp *wantypes.Cred
 		cfg:                     f.Webauthn,
 		rpID:                    rpID,
 		origin:                  origin,
-		requireUserVerification: passwordless,
+		requireUserVerification: discoverableLogin,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	var credential *wan.Credential
-	if passwordless {
+	if discoverableLogin {
 		discoverUser := func(_, _ []byte) (wan.User, error) { return u, nil }
 		credential, err = web.ValidateDiscoverableLogin(discoverUser, *sessionData, parsedResp)
 	} else {
@@ -342,7 +371,7 @@ func (f *loginFlow) finish(ctx context.Context, user string, resp *wantypes.Cred
 	}
 
 	// Update last used timestamp and device counter.
-	if err := setCounterAndTimestamps(dev, credential); err != nil {
+	if err := updateCredentialAndTimestamps(dev, credential, discoverableLogin); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// Retroactively write the credential RPID, now that it cleared authn.
@@ -405,15 +434,48 @@ func findDeviceByID(devices []*types.MFADevice, id []byte) (*types.MFADevice, bo
 	return nil, false
 }
 
-func setCounterAndTimestamps(dev *types.MFADevice, credential *wan.Credential) error {
-	switch d := dev.Device.(type) {
+func updateCredentialAndTimestamps(
+	dest *types.MFADevice,
+	credential *wan.Credential,
+	discoverableLogin bool,
+) error {
+	switch d := dest.Device.(type) {
 	case *types.MFADevice_U2F:
 		d.U2F.Counter = credential.Authenticator.SignCount
+
 	case *types.MFADevice_Webauthn:
 		d.Webauthn.SignatureCounter = credential.Authenticator.SignCount
+
+		// Backfill ResidentKey field.
+		// This may happen if an authenticator created for "MFA" was actually
+		// resident all along (eg, Safari/Touch ID registrations).
+		if discoverableLogin && !d.Webauthn.ResidentKey {
+			d.Webauthn.ResidentKey = true
+		}
+
+		// Backfill BE/BS bits.
+		if d.Webauthn.CredentialBackupEligible == nil {
+			d.Webauthn.CredentialBackupEligible = &gogotypes.BoolValue{
+				Value: credential.Flags.BackupEligible,
+			}
+			log.WithFields(log.Fields{
+				"device": dest.GetName(),
+				"be":     credential.Flags.BackupEligible,
+			}).Debug("Backfilled Webauthn device BE flag")
+		}
+		if d.Webauthn.CredentialBackedUp == nil {
+			d.Webauthn.CredentialBackedUp = &gogotypes.BoolValue{
+				Value: credential.Flags.BackupState,
+			}
+			log.WithFields(log.Fields{
+				"device": dest.GetName(),
+				"bs":     credential.Flags.BackupState,
+			}).Debug("Backfilled Webauthn device BS flag")
+		}
+
 	default:
 		return trace.BadParameter("unexpected device type for webauthn: %T", d)
 	}
-	dev.LastUsed = time.Now()
+	dest.LastUsed = time.Now()
 	return nil
 }

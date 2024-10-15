@@ -18,7 +18,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import styled from 'styled-components';
-import { Box, ButtonPrimary, Flex, Text, Alert } from 'design';
+import { Box, ButtonPrimary, Flex, Text, Alert, H1 } from 'design';
 import { Attempt, makeEmptyAttempt, useAsync } from 'shared/hooks/useAsync';
 import { wait } from 'shared/utils/wait';
 import * as Alerts from 'design/Alert';
@@ -32,7 +32,7 @@ import {
   useConnectMyComputerContext,
 } from 'teleterm/ui/ConnectMyComputer';
 import { codeOrSignal } from 'teleterm/ui/utils/process';
-import { isAccessDeniedError } from 'teleterm/services/tshd/errors';
+import { isTshdRpcError } from 'teleterm/services/tshd/cloneableClient';
 import { useResourcesContext } from 'teleterm/ui/DocumentCluster/resourcesContext';
 import { DocumentConnectMyComputer } from 'teleterm/ui/services/workspacesService';
 
@@ -52,9 +52,7 @@ export function Setup(props: {
 
   return (
     <Box maxWidth="680px" mx="auto" mt="4" px="5" width="100%">
-      <Text typography="h3" mb="4">
-        Connect My Computer
-      </Text>
+      <H1 mb="4">Connect My Computer</H1>
       {step === 'information' && (
         <Information
           onSetUpAgentClick={() => setStep('agent-setup')}
@@ -234,14 +232,16 @@ function AgentSetup() {
             let certsReloaded = false;
 
             try {
-              const response = await ctx.connectMyComputerService.createRole(
-                rootClusterUri
-              );
+              const response =
+                await ctx.connectMyComputerService.createRole(rootClusterUri);
               certsReloaded = response.certsReloaded;
             } catch (error) {
-              if (isAccessDeniedError(error)) {
+              if (
+                isTshdRpcError(error, 'PERMISSION_DENIED') &&
+                !error.isResolvableWithRelogin
+              ) {
                 throw new Error(
-                  'Access denied. Contact your administrator for permissions to manage users and roles.'
+                  `Cannot set up the role: ${error.message}. Contact your administrator for permissions to manage users and roles.`
                 );
               }
               throw error;

@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
@@ -38,7 +39,7 @@ import (
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
@@ -51,9 +52,9 @@ type HandlerConfig struct {
 	// Clock is used to control time in tests.
 	Clock clockwork.Clock
 	// AuthClient is a direct client to auth.
-	AuthClient auth.ClientI
+	AuthClient authclient.ClientI
 	// AccessPoint is caching client to auth.
-	AccessPoint auth.ProxyAccessPoint
+	AccessPoint authclient.ProxyAccessPoint
 	// ProxyClient holds connections to leaf clusters.
 	ProxyClient reversetunnelclient.Tunnel
 	// ProxyPublicAddrs contains web proxy public addresses.
@@ -63,6 +64,9 @@ type HandlerConfig struct {
 	CipherSuites []uint16
 	// WebPublicAddr
 	WebPublicAddr string
+	// IntegrationAppHandler handles App Access requests directly - not requiring an AppService.
+	// Only available for AWS OIDC Integrations.
+	IntegrationAppHandler ServerHandler
 }
 
 // CheckAndSetDefaults validates configuration.
@@ -80,6 +84,9 @@ func (c *HandlerConfig) CheckAndSetDefaults() error {
 	if len(c.CipherSuites) == 0 {
 		return trace.BadParameter("ciphersuites missing")
 	}
+	if c.IntegrationAppHandler == nil {
+		return trace.BadParameter("integration app handler missing")
+	}
 
 	return nil
 }
@@ -92,7 +99,7 @@ type Handler struct {
 
 	router *httprouter.Router
 
-	cache *sessionCache
+	cache *utils.FnCache
 
 	clusterName string
 
@@ -110,13 +117,19 @@ func NewHandler(ctx context.Context, c *HandlerConfig) (*Handler, error) {
 		c:            c,
 		closeContext: ctx,
 		log: logrus.WithFields(logrus.Fields{
-			trace.Component: teleport.ComponentAppProxy,
+			teleport.ComponentKey: teleport.ComponentAppProxy,
 		}),
 	}
 
 	// Create a new session cache, this holds sessions that can be used to
 	// forward requests.
-	h.cache, err = newSessionCache(ctx, h.log)
+	h.cache, err = utils.NewFnCache(utils.FnCacheConfig{
+		TTL:             time.Second, // Doesn't matter, TTL is always set on an item by item basis.
+		Clock:           h.c.Clock,
+		Context:         ctx,
+		CleanupInterval: time.Second,
+		ReloadOnErr:     true,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -132,13 +145,7 @@ func NewHandler(ctx context.Context, c *HandlerConfig) (*Handler, error) {
 	h.router = httprouter.New()
 	h.router.UseRawPath = true
 	h.router.GET("/x-teleport-auth", makeRouterHandler(h.startAppAuthExchange))
-	// DELETE IN 17.0
-	// Kept for legacy app access.
-	h.router.OPTIONS("/x-teleport-auth", makeRouterHandler(h.withCustomCORS(nil)))
-	// DELETE IN 17.0
-	// when deleting, replace with the commented handler below:
-	//   h.router.POST("/x-teleport-auth", makeRouterHandler(h.completeAppAuthExchange))
-	h.router.POST("/x-teleport-auth", makeRouterHandler(h.withCustomCORS(h.handleAuth)))
+	h.router.POST("/x-teleport-auth", makeRouterHandler(h.completeAppAuthExchange))
 	h.router.GET("/teleport-logout", h.withRouterAuth(h.handleLogout))
 	h.router.NotFound = h.withAuth(h.handleHttp)
 
@@ -356,7 +363,7 @@ func (h *Handler) renewSession(r *http.Request) (*session, error) {
 
 	// Remove the session from the cache, this will force a new session to be
 	// generated and cached.
-	h.cache.remove(ws.GetName())
+	h.cache.Remove(ws.GetName())
 
 	// Fetches a new session using the same flow as `authenticate`.
 	session, err := h.getSession(r.Context(), ws)
@@ -477,25 +484,13 @@ func (h *Handler) getAppSessionFromCookie(r *http.Request) (types.WebSession, er
 // application service. Always checks if the session is valid first and if so,
 // will return a cached session, otherwise will create one.
 func (h *Handler) getSession(ctx context.Context, ws types.WebSession) (*session, error) {
-	// If a cached session exists, return it right away.
-	session, err := h.cache.get(ws.GetName())
-	if err == nil {
-		return session, nil
-	}
-
-	// Create a new session with a forwarder in it.
-	session, err = h.newSession(ctx, ws)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	// Put the session in the cache so the next request can use it.
-	err = h.cache.set(ws.GetName(), session, ws.Expiry().Sub(h.c.Clock.Now()))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return session, nil
+	ttl := ws.Expiry().Sub(h.c.Clock.Now())
+	sess, err := utils.FnCacheGetWithTTL(ctx, h.cache, ws.GetName(), ttl, func(ctx context.Context) (*session, error) {
+		sess, err := h.newSession(ctx, ws)
+		return sess, trace.Wrap(err)
+	})
+	return sess, trace.Wrap(err)
 }
 
 // extractCookie extracts the cookie from the *http.Request.
@@ -630,10 +625,13 @@ func makeAppRedirectURL(r *http.Request, proxyPublicAddr, hostname string, req l
 	}
 
 	// Presence of a stateToken means we are beginning an app auth exchange.
-	if req.stateToken != "" {
+	if req.stateToken != "" || req.requiresAppRedirect {
 		v := url.Values{}
-		v.Add("state", req.stateToken)
+		if req.stateToken != "" {
+			v.Add("state", req.stateToken)
+		}
 		v.Add("path", req.path)
+		v.Add("required-apps", req.requiredAppFQDNs)
 		u.RawQuery = v.Encode()
 
 		urlPath := []string{"web", "launch", hostname}
@@ -666,6 +664,9 @@ func makeAppRedirectURL(r *http.Request, proxyPublicAddr, hostname string, req l
 		// So Encode() will just encode it once (note that spaces will be convereted to `+`)
 		v := url.Values{}
 		v.Add("path", r.URL.Path)
+		if req.requiredAppFQDNs != "" {
+			v.Add("required-apps", req.requiredAppFQDNs)
+		}
 
 		if len(r.URL.RawQuery) > 0 {
 			v.Add("query", r.URL.RawQuery)

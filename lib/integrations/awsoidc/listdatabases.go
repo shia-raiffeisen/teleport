@@ -27,7 +27,8 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/services"
+	cloudaws "github.com/gravitational/teleport/lib/cloud/aws"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 var (
@@ -58,6 +59,8 @@ type ListDatabasesRequest struct {
 	// NextToken is the token to be used to fetch the next page.
 	// If empty, the first page is fetched.
 	NextToken string
+	// VpcId filters databases to only include those deployed in the VPC.
+	VpcId string
 }
 
 // CheckAndSetDefaults checks if the required fields are present.
@@ -103,58 +106,11 @@ func NewListDatabasesClient(ctx context.Context, req *AWSClientRequest) (ListDat
 	return newRDSClient(ctx, req)
 }
 
-// ListAllDatabases collects dbs until end of pages for all supported RDS engines and types.
-func ListAllDatabases(ctx context.Context, clt ListDatabasesClient, region string) (*ListDatabasesResponse, error) {
-	fetchedRDSs := []types.Database{}
-
-	// Get all rds instances.
-	nextToken := ""
-	for {
-		resp, err := ListDatabases(ctx,
-			clt,
-			ListDatabasesRequest{
-				Region:    region,
-				Engines:   []string{services.RDSEngineMySQL, services.RDSEngineMariaDB, services.RDSEnginePostgres},
-				RDSType:   rdsTypeInstance,
-				NextToken: nextToken,
-			},
-		)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		fetchedRDSs = append(fetchedRDSs, resp.Databases...)
-		nextToken = resp.NextToken
-
-		if len(nextToken) == 0 {
-			break
-		}
-	}
-
-	// Get all rds clusters.
-	nextToken = ""
-	for {
-		resp, err := ListDatabases(ctx,
-			clt,
-			ListDatabasesRequest{
-				Region:    region,
-				Engines:   []string{services.RDSEngineAuroraMySQL, services.RDSEngineAuroraPostgres},
-				RDSType:   rdsTypeCluster,
-				NextToken: nextToken,
-			},
-		)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		fetchedRDSs = append(fetchedRDSs, resp.Databases...)
-		nextToken = resp.NextToken
-
-		if len(nextToken) == 0 {
-			break
-		}
-	}
-
-	return &ListDatabasesResponse{Databases: fetchedRDSs}, nil
-}
+// listDatabasesPageSize is half the default RDS list input page size (100).
+// We filter by VPC membership after the API call and try to return
+// listDatabasesPageSize items but can return up to listDatabasesPageSize*2 -1
+// items, so we use a smaller page size than the default.
+var listDatabasesPageSize int32 = 50
 
 // ListDatabases calls the following AWS API:
 // https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DescribeDBClusters.html
@@ -165,6 +121,26 @@ func ListDatabases(ctx context.Context, clt ListDatabasesClient, req ListDatabas
 		return nil, trace.Wrap(err)
 	}
 
+	all := &ListDatabasesResponse{}
+	for {
+		res, err := listDatabases(ctx, clt, req)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		all.Databases = append(all.Databases, res.Databases...)
+		// keep fetching databases until we fill at least pageSize or run out of
+		// pages, that way we don't return strange results like 0 databases with
+		// a NextToken to fetch more.
+		if len(all.Databases) >= int(listDatabasesPageSize) || res.NextToken == "" {
+			all.NextToken = res.NextToken
+			return all, nil
+		}
+		// re-use the request but update its NextToken for each API call.
+		req.NextToken = res.NextToken
+	}
+}
+
+func listDatabases(ctx context.Context, clt ListDatabasesClient, req ListDatabasesRequest) (*ListDatabasesResponse, error) {
 	// Uses https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DescribeDBInstances.html
 	if req.RDSType == rdsTypeInstance {
 		ret, err := listDBInstances(ctx, clt, req)
@@ -187,6 +163,7 @@ func listDBInstances(ctx context.Context, clt ListDatabasesClient, req ListDatab
 		Filters: []rdsTypes.Filter{
 			{Name: &filterEngine, Values: req.Engines},
 		},
+		MaxRecords: &listDatabasesPageSize,
 	}
 	if req.NextToken != "" {
 		describeDBInstanceInput.Marker = &req.NextToken
@@ -205,15 +182,17 @@ func listDBInstances(ctx context.Context, clt ListDatabasesClient, req ListDatab
 
 	ret.Databases = make([]types.Database, 0, len(rdsDBs.DBInstances))
 	for _, db := range rdsDBs.DBInstances {
-		if !services.IsRDSInstanceAvailable(db.DBInstanceStatus, db.DBInstanceIdentifier) {
+		if !cloudaws.IsDBClusterAvailable(db.DBInstanceStatus, db.DBInstanceIdentifier) {
+			continue
+		}
+		if req.VpcId != "" && !subnetGroupIsInVPC(db.DBSubnetGroup, req.VpcId) {
 			continue
 		}
 
-		dbServer, err := services.NewDatabaseFromRDSV2Instance(&db)
+		dbServer, err := common.NewDatabaseFromRDSV2Instance(&db)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-
 		ret.Databases = append(ret.Databases, dbServer)
 	}
 
@@ -225,6 +204,7 @@ func listDBClusters(ctx context.Context, clt ListDatabasesClient, req ListDataba
 		Filters: []rdsTypes.Filter{
 			{Name: &filterEngine, Values: req.Engines},
 		},
+		MaxRecords: &listDatabasesPageSize,
 	}
 	if req.NextToken != "" {
 		describeDBClusterInput.Marker = &req.NextToken
@@ -243,7 +223,7 @@ func listDBClusters(ctx context.Context, clt ListDatabasesClient, req ListDataba
 
 	ret.Databases = make([]types.Database, 0, len(rdsDBs.DBClusters))
 	for _, db := range rdsDBs.DBClusters {
-		if !services.IsRDSClusterAvailable(db.Status, db.DBClusterIdentifier) {
+		if !cloudaws.IsDBClusterAvailable(db.Status, db.DBClusterIdentifier) {
 			continue
 		}
 
@@ -256,7 +236,11 @@ func listDBClusters(ctx context.Context, clt ListDatabasesClient, req ListDataba
 			return nil, trace.Wrap(err)
 		}
 
-		awsDB, err := services.NewDatabaseFromRDSV2Cluster(&db, clusterInstance)
+		if req.VpcId != "" && !subnetGroupIsInVPC(clusterInstance.DBSubnetGroup, req.VpcId) {
+			continue
+		}
+
+		awsDB, err := common.NewDatabaseFromRDSV2Cluster(&db, clusterInstance)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -284,4 +268,10 @@ func fetchSingleRDSDBInstance(ctx context.Context, clt ListDatabasesClient, req 
 	}
 
 	return &rdsDBs.DBInstances[0], nil
+}
+
+// subnetGroupIsInVPC is a simple helper to check if a db subnet group is in
+// a given VPC.
+func subnetGroupIsInVPC(group *rdsTypes.DBSubnetGroup, vpcID string) bool {
+	return group != nil && aws.ToString(group.VpcId) == vpcID
 }

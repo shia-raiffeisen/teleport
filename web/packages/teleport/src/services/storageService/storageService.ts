@@ -16,17 +16,13 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { DeprecatedThemeOption } from 'design/theme/types';
-
 import { UserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/userpreferences_pb';
-
 import { Theme } from 'gen-proto-ts/teleport/userpreferences/v1/theme_pb';
-
 import { OnboardUserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/onboard_pb';
 
+import { getPrefersDark } from 'teleport/ThemeProvider';
 import { BearerToken } from 'teleport/services/websession';
 import { OnboardDiscover } from 'teleport/services/user';
-
 import {
   BackendUserPreferences,
   convertBackendUserPreferences,
@@ -40,26 +36,38 @@ import type { RecommendFeature } from 'teleport/types';
 // This is an array of local storage `KeysEnum` that are kept when a user logs out
 const KEEP_LOCALSTORAGE_KEYS_ON_LOGOUT = [
   KeysEnum.THEME,
-  KeysEnum.SHOW_ASSIST_POPUP,
   KeysEnum.USER_PREFERENCES,
   KeysEnum.RECOMMEND_FEATURE,
+  KeysEnum.LICENSE_ACKNOWLEDGED,
+  KeysEnum.USERS_NOT_EQUAL_TO_MAU_ACKNOWLEDGED,
+  KeysEnum.USE_NEW_ROLE_EDITOR,
 ];
 
 export const storageService = {
   clear() {
     Object.keys(window.localStorage).forEach(key => {
-      if (!KEEP_LOCALSTORAGE_KEYS_ON_LOGOUT.includes(key)) {
+      const isAccessGraph = key.startsWith('tag_');
+
+      if (!isAccessGraph && !KEEP_LOCALSTORAGE_KEYS_ON_LOGOUT.includes(key)) {
         window.localStorage.removeItem(key);
       }
     });
   },
 
-  subscribe(fn) {
+  subscribe(fn: (e: StorageEvent) => void) {
     window.addEventListener('storage', fn);
   },
 
-  unsubscribe(fn) {
+  unsubscribe(fn: (e: StorageEvent) => void) {
     window.removeEventListener('storage', fn);
+  },
+
+  getParsedJSONValue<T>(key: string, defaultValue: T): T {
+    const item = window.localStorage.getItem(key);
+    if (item) {
+      return JSON.parse(item);
+    }
+    return defaultValue;
   },
 
   setBearerToken(token: BearerToken) {
@@ -67,12 +75,7 @@ export const storageService = {
   },
 
   getBearerToken(): BearerToken {
-    const item = window.localStorage.getItem(KeysEnum.TOKEN);
-    if (item) {
-      return JSON.parse(item);
-    }
-
-    return null;
+    return this.getParsedJSONValue(KeysEnum.TOKEN, null);
   },
 
   getAccessToken() {
@@ -103,11 +106,7 @@ export const storageService = {
   },
 
   getOnboardDiscover(): OnboardDiscover {
-    const item = window.localStorage.getItem(KeysEnum.DISCOVER);
-    if (item) {
-      return JSON.parse(item);
-    }
-    return null;
+    return this.getParsedJSONValue(KeysEnum.DISCOVER, null);
   },
 
   getUserPreferences(): UserPreferences {
@@ -142,11 +141,7 @@ export const storageService = {
   },
 
   getOnboardSurvey(): LocalStorageSurvey {
-    const survey = window.localStorage.getItem(KeysEnum.ONBOARD_SURVEY);
-    if (survey) {
-      return JSON.parse(survey);
-    }
-    return null;
+    return this.getParsedJSONValue(KeysEnum.ONBOARD_SURVEY, null);
   },
 
   setOnboardSurvey(survey: LocalStorageSurvey) {
@@ -160,11 +155,7 @@ export const storageService = {
   },
 
   getCloudUserInvites(): CloudUserInvites {
-    const invites = window.localStorage.getItem(KeysEnum.CLOUD_USER_INVITES);
-    if (invites) {
-      return JSON.parse(invites);
-    }
-    return null;
+    return this.getParsedJSONValue(KeysEnum.CLOUD_USER_INVITES, null);
   },
 
   setCloudUserInvites(invites: CloudUserInvites) {
@@ -179,16 +170,12 @@ export const storageService = {
 
   getThemePreference(): Theme {
     const userPreferences = storageService.getUserPreferences();
-    if (userPreferences) {
+    if (userPreferences && userPreferences.theme !== Theme.UNSPECIFIED) {
       return userPreferences.theme;
     }
 
-    const theme = this.getDeprecatedThemePreference();
-    if (theme) {
-      return theme === 'light' ? Theme.LIGHT : Theme.DARK;
-    }
-
-    return Theme.LIGHT;
+    const prefersDark = getPrefersDark();
+    return prefersDark ? Theme.DARK : Theme.LIGHT;
   },
 
   getOnboardUserPreference(): OnboardUserPreferences {
@@ -208,19 +195,27 @@ export const storageService = {
     };
   },
 
-  // DELETE IN 15 (ryan)
-  getDeprecatedThemePreference(): DeprecatedThemeOption {
-    return window.localStorage.getItem(KeysEnum.THEME) as DeprecatedThemeOption;
-  },
-
-  // TODO(ryan): remove in v15
-  clearDeprecatedThemePreference() {
-    window.localStorage.removeItem(KeysEnum.THEME);
-  },
-
-  arePinnedResourcesDisabled(): boolean {
+  getLicenseAcknowledged(): boolean {
     return (
-      window.localStorage.getItem(KeysEnum.PINNED_RESOURCES_NOT_SUPPORTED) ===
+      window.localStorage.getItem(KeysEnum.LICENSE_ACKNOWLEDGED) === 'true'
+    );
+  },
+
+  setLicenseAcknowledged() {
+    window.localStorage.setItem(KeysEnum.LICENSE_ACKNOWLEDGED, 'true');
+  },
+
+  getUsersMauAcknowledged(): boolean {
+    return (
+      window.localStorage.getItem(
+        KeysEnum.USERS_NOT_EQUAL_TO_MAU_ACKNOWLEDGED
+      ) === 'true'
+    );
+  },
+
+  setUsersMAUAcknowledged() {
+    window.localStorage.setItem(
+      KeysEnum.USERS_NOT_EQUAL_TO_MAU_ACKNOWLEDGED,
       'true'
     );
   },
@@ -238,37 +233,22 @@ export const storageService = {
   },
 
   getFeatureRecommendationStatus(): RecommendFeature {
-    const item = window.localStorage.getItem(KeysEnum.RECOMMEND_FEATURE);
-    if (item) {
-      return JSON.parse(item);
-    }
-    return null;
+    return this.getParsedJSONValue(KeysEnum.RECOMMEND_FEATURE, null);
   },
 
   getAccessGraphEnabled(): boolean {
-    const item = window.localStorage.getItem(KeysEnum.ACCESS_GRAPH_ENABLED);
-    if (item) {
-      return JSON.parse(item);
-    }
-    return false;
+    return this.getParsedJSONValue(KeysEnum.ACCESS_GRAPH_ENABLED, false);
   },
 
   getAccessGraphSQLEnabled(): boolean {
-    const item = window.localStorage.getItem(KeysEnum.ACCESS_GRAPH_SQL_ENABLED);
-    if (item) {
-      return JSON.parse(item);
-    }
-    return false;
+    return this.getParsedJSONValue(KeysEnum.ACCESS_GRAPH_SQL_ENABLED, false);
   },
 
   getExternalAuditStorageCtaDisabled(): boolean {
-    const item = window.localStorage.getItem(
-      KeysEnum.EXTERNAL_AUDIT_STORAGE_CTA_DISABLED
+    return this.getParsedJSONValue(
+      KeysEnum.EXTERNAL_AUDIT_STORAGE_CTA_DISABLED,
+      false
     );
-    if (item) {
-      return JSON.parse(item);
-    }
-    return false;
   },
 
   disableExternalAuditStorageCta(): void {
@@ -276,5 +256,13 @@ export const storageService = {
       KeysEnum.EXTERNAL_AUDIT_STORAGE_CTA_DISABLED,
       JSON.stringify(true)
     );
+  },
+
+  getUseNewRoleEditor(): boolean {
+    return this.getParsedJSONValue(KeysEnum.USE_NEW_ROLE_EDITOR, false);
+  },
+
+  getIsTopBarView(): boolean {
+    return this.getParsedJSONValue(KeysEnum.USE_TOP_BAR, false);
   },
 };

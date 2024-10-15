@@ -321,6 +321,7 @@ func TestUpload(t *testing.T) {
 			},
 			errCheck: func(t require.TestingT, err error, i ...interface{}) {
 				require.EqualError(t, err, fmt.Sprintf(`"%s/src" is a directory, but the recursive option was not passed`, i[0]))
+				require.ErrorAs(t, err, new(*NonRecursiveDirectoryTransferError))
 			},
 		},
 		{
@@ -772,7 +773,7 @@ func checkTransfer(t *testing.T, preserveAttrs bool, dst string, srcs ...string)
 			dstPath := filepath.Join(dst, relPath)
 			dstInfo, err := os.Stat(dstPath)
 			if err != nil {
-				return fmt.Errorf("error getting dst file info: %v", err)
+				return fmt.Errorf("error getting dst file info: %w", err)
 			}
 			require.Equal(t, info.IsDir(), dstInfo.IsDir(), "expected %q IsDir=%t, got %t", dstPath, info.IsDir(), dstInfo.IsDir())
 

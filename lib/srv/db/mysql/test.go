@@ -32,15 +32,26 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
+// TestClientConn defines interface for client.Conn.
+type TestClientConn interface {
+	Execute(command string, args ...interface{}) (*mysql.Result, error)
+	Close() error
+	UseDB(dbName string) error
+	GetServerVersion() string
+	Ping() error
+	WritePacket(data []byte) error
+}
+
 // MakeTestClient returns MySQL client connection according to the provided
 // parameters.
-func MakeTestClient(config common.TestClientConfig) (*client.Conn, error) {
+func MakeTestClient(config common.TestClientConfig) (TestClientConn, error) {
 	tlsConfig, err := common.MakeTestClientTLSConfig(config)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -49,18 +60,21 @@ func MakeTestClient(config common.TestClientConfig) (*client.Conn, error) {
 		config.RouteToDatabase.Username,
 		"",
 		config.RouteToDatabase.Database,
-		func(conn *client.Conn) {
+		func(conn *client.Conn) error {
 			conn.SetTLSConfig(tlsConfig)
+			return nil
 		})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return conn, nil
+	return &clientConn{
+		Conn: conn,
+	}, nil
 }
 
 // MakeTestClientWithoutTLS returns a MySQL client connection without setting
 // TLS config to the MySQL client.
-func MakeTestClientWithoutTLS(addr string, routeToDatabase tlsca.RouteToDatabase) (*client.Conn, error) {
+func MakeTestClientWithoutTLS(addr string, routeToDatabase tlsca.RouteToDatabase) (TestClientConn, error) {
 	conn, err := client.Connect(addr,
 		routeToDatabase.Username,
 		"",
@@ -69,7 +83,9 @@ func MakeTestClientWithoutTLS(addr string, routeToDatabase tlsca.RouteToDatabase
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return conn, nil
+	return &clientConn{
+		Conn: conn,
+	}, nil
 }
 
 // UserEvent represents a user activation/deactivation event.
@@ -135,8 +151,8 @@ func NewTestServer(config common.TestServerConfig, opts ...TestServerOption) (sv
 	}
 
 	log := logrus.WithFields(logrus.Fields{
-		trace.Component: defaults.ProtocolMySQL,
-		"name":          config.Name,
+		teleport.ComponentKey: defaults.ProtocolMySQL,
+		"name":                config.Name,
 	})
 	server := &TestServer{
 		cfg:      config,
@@ -319,7 +335,7 @@ func (h *testHandler) HandleStmtPrepare(prepare string) (int, int, interface{}, 
 	return params, 0, nil, nil
 }
 func (h *testHandler) HandleStmtExecute(_ interface{}, query string, args []interface{}) (*mysql.Result, error) {
-	h.log.Debugf("Received execute %q with args %+v.", args)
+	h.log.Debugf("Received execute %q with args %+v.", query, args)
 	if strings.HasPrefix(query, "CALL ") {
 		return h.handleCallProcedure(query, args)
 	}

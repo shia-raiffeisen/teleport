@@ -20,6 +20,8 @@ import api from 'teleport/services/api';
 import cfg, { UrlAppParams, UrlResourcesParams } from 'teleport/config';
 import { ResourcesResponse } from 'teleport/services/agents';
 
+import auth, { MfaChallengeScope } from 'teleport/services/auth/auth';
+
 import makeApp from './makeApps';
 import { App } from './types';
 
@@ -39,27 +41,50 @@ const service = {
     });
   },
 
-  createAppSession(params: UrlAppParams) {
-    const { fqdn, clusterId = '', publicAddr = '', arn = '' } = params;
-    return api
-      .post(cfg.api.appSession, {
-        fqdn,
-        cluster_name: clusterId,
-        public_addr: publicAddr,
-        arn: arn,
-      })
-      .then(json => ({
-        fqdn: json.fqdn as string,
-        cookieValue: json.cookie_value as string,
-        subjectCookieValue: json.subject_cookie_value as string,
-      }));
-  },
+  async createAppSession(params: UrlAppParams) {
+    const resolveApp = {
+      fqdn: params.fqdn,
+      cluster_name: params.clusterId,
+      public_addr: params.publicAddr,
+    };
 
-  getAppFqdn(params: UrlAppParams) {
-    return api.get(cfg.getAppFqdnUrl(params)).then(json => ({
+    // Prompt for MFA if per-session MFA is required for this app.
+    const webauthnResponse = await auth.getWebauthnResponse(
+      MfaChallengeScope.USER_SESSION,
+      false,
+      {
+        app: resolveApp,
+      }
+    );
+
+    const createAppSession = {
+      ...resolveApp,
+      arn: params.arn,
+      mfa_response: webauthnResponse
+        ? JSON.stringify({
+            webauthnAssertionResponse: webauthnResponse,
+          })
+        : null,
+    };
+
+    return api.post(cfg.api.appSession, createAppSession).then(json => ({
       fqdn: json.fqdn as string,
+      cookieValue: json.cookie_value as string,
+      subjectCookieValue: json.subject_cookie_value as string,
     }));
   },
+
+  getAppDetails(params: UrlAppParams): Promise<AppDetails> {
+    return api.get(cfg.getAppDetailsUrl(params)).then(json => ({
+      fqdn: json.fqdn,
+      requiredAppFQDNs: json.requiredAppFQDNs,
+    }));
+  },
+};
+
+type AppDetails = {
+  fqdn: string;
+  requiredAppFQDNs?: string[];
 };
 
 export default service;

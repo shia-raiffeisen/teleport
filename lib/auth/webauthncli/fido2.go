@@ -25,10 +25,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -138,9 +138,7 @@ var (
 
 // isLibfido2Enabled returns true if libfido2 is available in the current build.
 func isLibfido2Enabled() bool {
-	val, ok := os.LookupEnv("TELEPORT_FIDO2")
-	// Default to enabled, otherwise obey the env variable.
-	return !ok || val == "1"
+	return true
 }
 
 // fido2Login implements FIDO2Login.
@@ -223,7 +221,7 @@ func fido2Login(
 		if uv {
 			opts.UV = libfido2.True
 		}
-		assertions, err := dev.Assertion(actualRPID, ccdHash[:], allowedCreds, pin, opts)
+		assertions, err := devAssertion(dev, info, actualRPID, ccdHash[:], allowedCreds, pin, opts)
 		if errors.Is(err, libfido2.ErrUnsupportedOption) && uv && pin != "" {
 			// Try again if we are getting "unsupported option" and the PIN is set.
 			// Happens inconsistently in some authenticator series (YubiKey 5).
@@ -231,10 +229,21 @@ func fido2Login(
 			// authenticator will set the UV bit regardless of it being requested.
 			log.Debugf("FIDO2: Device %v: retrying assertion without UV", info.path)
 			opts.UV = libfido2.Default
-			assertions, err = dev.Assertion(actualRPID, ccdHash[:], allowedCreds, pin, opts)
+			assertions, err = devAssertion(dev, info, actualRPID, ccdHash[:], allowedCreds, pin, opts)
 		}
 		if errors.Is(err, libfido2.ErrNoCredentials) {
-			err = ErrUsingNonRegisteredDevice // "Upgrade" error message.
+			// U2F devices error instantly with ErrNoCredentials.
+			// If that is the case, we mark the error as non-interactive and continue
+			// without this device. This is the only safe option, as it lets the
+			// handleDevice goroutine exit gracefully. Do not attempt to wait for
+			// touch - this causes another slew of problems with abandoned U2F
+			// goroutines during registration.
+			if !info.fido2 {
+				log.Debugf("FIDO2: U2F device %v not registered, ignoring it", info.path)
+				err = &nonInteractiveError{err: err}
+			} else {
+				err = ErrUsingNonRegisteredDevice // "Upgrade" error message.
+			}
 		}
 		if err != nil {
 			return trace.Wrap(err)
@@ -304,11 +313,73 @@ func usesAppID(dev FIDODevice, info *deviceInfo, ccdHash []byte, allowedCreds []
 
 	isRegistered := func(id string) bool {
 		const pin = "" // Not necessary here.
-		_, err := dev.Assertion(id, ccdHash, allowedCreds, pin, opts)
+		_, err := devAssertion(dev, info, id, ccdHash, allowedCreds, pin, opts)
 		return err == nil || (!info.fido2 && errors.Is(err, libfido2.ErrUserPresenceRequired))
 	}
 
 	return isRegistered(appID) && !isRegistered(rpID)
+}
+
+func devAssertion(
+	dev FIDODevice,
+	info *deviceInfo,
+	rpID string,
+	ccdHash []byte,
+	allowedCreds [][]byte,
+	pin string,
+	opts *libfido2.AssertionOpts,
+) ([]*libfido2.Assertion, error) {
+	// Handle U2F devices separately when there is more than one allowed
+	// credential.
+	// This avoids "internal errors" on older Yubikey models (eg, FIDO U2F
+	// Security Key firmware 4.1.8).
+	if !info.fido2 && len(allowedCreds) > 1 {
+		cred, ok := findFirstKnownCredential(dev, info, rpID, ccdHash, allowedCreds)
+		if ok {
+			isCredentialCheck := pin == "" && opts != nil && opts.UP == libfido2.False
+			if isCredentialCheck {
+				// No need to assert again, reply as the U2F authenticator would.
+				return nil, trace.Wrap(libfido2.ErrUserPresenceRequired)
+			}
+
+			if log.IsLevelEnabled(log.DebugLevel) {
+				credPrefix := hex.EncodeToString(cred)
+				const prefixLen = 10
+				if len(credPrefix) > prefixLen {
+					credPrefix = credPrefix[:prefixLen]
+				}
+				log.Debugf("FIDO2: Device %v: Using credential %v...", info.path, credPrefix)
+			}
+
+			allowedCreds = [][]byte{cred}
+		}
+	}
+
+	assertion, err := dev.Assertion(rpID, ccdHash, allowedCreds, pin, opts)
+	return assertion, trace.Wrap(err)
+}
+
+func findFirstKnownCredential(
+	dev FIDODevice,
+	info *deviceInfo,
+	rpID string,
+	ccdHash []byte,
+	allowedCreds [][]byte,
+) ([]byte, bool) {
+	const pin = ""
+	opts := &libfido2.AssertionOpts{
+		UP: libfido2.False,
+	}
+	for _, cred := range allowedCreds {
+		_, err := dev.Assertion(rpID, ccdHash, [][]byte{cred}, pin, opts)
+		// FIDO2 devices return err=nil on up=false queries; U2F devices return
+		// libfido2.ErrUserPresenceRequired.
+		// https://github.com/Yubico/libfido2/blob/03c18d396eb209a42bbf62f5f4415203cba2fc50/src/u2f.c#L787-L791.
+		if err == nil || (!info.fido2 && errors.Is(err, libfido2.ErrUserPresenceRequired)) {
+			return cred, true
+		}
+	}
+	return nil, false
 }
 
 func pickAssertion(
@@ -444,7 +515,7 @@ func fido2Register(
 
 		// Does the device hold an excluded credential?
 		const pin = "" // not required to filter
-		switch _, err := dev.Assertion(rp.ID, ccdHash[:], excludeList, pin, &libfido2.AssertionOpts{
+		switch _, err := devAssertion(dev, info, rp.ID, ccdHash[:], excludeList, pin, &libfido2.AssertionOpts{
 			UP: libfido2.False,
 		}); {
 		case errors.Is(err, libfido2.ErrNoCredentials):
@@ -669,8 +740,15 @@ func startDevices(
 
 		dev, err := fidoNewDevice(path)
 		if err != nil {
-			closeAll()
-			return nil, nil, trace.Wrap(err, "device open")
+			// Be resilient to open errors.
+			// This can happen to devices that failed to cancel (and thus are still
+			// asserting) when we run sequential operations. For example: registration
+			// immediately followed by assertion (in a single process).
+			// This is largely safe to ignore, as opening is fairly consistent in
+			// other situations and failures are likely from a non-chosen device in
+			// multi-device scenarios.
+			log.Debugf("FIDO2: Device %v failed to open, skipping: %v", path, err)
+			continue
 		}
 
 		fidoDevs = append(fidoDevs, dev)
@@ -678,6 +756,9 @@ func startDevices(
 			path: path,
 			dev:  dev,
 		})
+	}
+	if len(fidoDevs) == 0 {
+		return nil, nil, errors.New("failed to open security keys")
 	}
 
 	// Prompt touch, it's about to begin.
@@ -942,7 +1023,7 @@ func withoutPINHandler(cb deviceCallbackFunc) pinAwareCallbackFunc {
 }
 
 // nonInteractiveError tags device errors that happen before user interaction.
-// These are are usually ignored in the context of selecting devices.
+// These are usually ignored in the context of selecting devices.
 type nonInteractiveError struct {
 	err error
 }

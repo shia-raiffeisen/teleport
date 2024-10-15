@@ -27,6 +27,8 @@ import (
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/types"
 	resourcesv2 "github.com/gravitational/teleport/integrations/operator/apis/resources/v2"
+	"github.com/gravitational/teleport/integrations/operator/controllers"
+	"github.com/gravitational/teleport/integrations/operator/controllers/reconcilers"
 )
 
 // userClient implements TeleportResourceClient and offers CRUD methods needed to reconcile users
@@ -57,20 +59,21 @@ func (r userClient) Delete(ctx context.Context, name string) error {
 	return trace.Wrap(r.teleportClient.DeleteUser(ctx, name))
 }
 
-// MutateExisting ensures the spec.createdBy property is persisted
-func (r userClient) MutateExisting(newUser, existingUser types.User) {
+// Mutate ensures the spec.createdBy property is persisted
+func (r userClient) Mutate(_ context.Context, newUser, existingUser types.User, _ kclient.ObjectKey) error {
 	if existingUser != nil {
 		newUser.SetCreatedBy(existingUser.GetCreatedBy())
 	}
+	return nil
 }
 
 // NewUserReconciler instantiates a new Kubernetes controller reconciling user resources
-func NewUserReconciler(client kclient.Client, tClient *client.Client) (Reconciler, error) {
+func NewUserReconciler(client kclient.Client, tClient *client.Client) (controllers.Reconciler, error) {
 	userClient := &userClient{
 		teleportClient: tClient,
 	}
 
-	resourceReconciler, err := NewTeleportResourceReconciler[types.User, *resourcesv2.TeleportUser](
+	resourceReconciler, err := reconcilers.NewTeleportResourceWithLabelsReconciler[types.User, *resourcesv2.TeleportUser](
 		client,
 		userClient,
 	)

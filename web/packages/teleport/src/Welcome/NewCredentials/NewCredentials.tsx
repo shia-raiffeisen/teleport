@@ -18,12 +18,10 @@
 
 import React, { useState } from 'react';
 import { NewFlow, StepSlider } from 'design/StepSlider';
-
-import { OnboardCard } from 'design/Onboard/OnboardCard';
-
 import { Box } from 'design';
 
-import RecoveryCodes from 'teleport/components/RecoveryCodes';
+import { OnboardCard } from 'teleport/components/Onboard';
+import OSSRecoveryCodes from 'teleport/components/RecoveryCodes';
 import cfg from 'teleport/config';
 
 import { loginFlows } from 'teleport/Welcome/NewCredentials/constants';
@@ -69,6 +67,7 @@ export function NewCredentials(props: NewCredentialsProps) {
     displayInviteCollaborators = false,
     setDisplayInviteCollaborators = null,
     InviteCollaborators = undefined,
+    RecoveryCodes,
   } = props;
 
   // Check which flow to render as default.
@@ -135,8 +134,11 @@ export function NewCredentials(props: NewCredentialsProps) {
   }
 
   if (recoveryCodes) {
+    // TODO(bl-nero): Remove OSSRecoveryCodes once the enterprise code passes
+    // the RecoveryCodesComponent through props.
+    const Component = RecoveryCodes || OSSRecoveryCodes;
     return (
-      <RecoveryCodes
+      <Component
         recoveryCodes={recoveryCodes}
         onContinue={finishedRegister}
         isNewCodes={resetMode}

@@ -20,18 +20,25 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/types/samlsp"
 )
 
 // TestNewSAMLIdPServiceProvider ensures a valid SAML IdP service provider.
 func TestNewSAMLIdPServiceProvider(t *testing.T) {
+	const acsURL = "https://example.com/acs"
 	tests := []struct {
-		name             string
-		entityDescriptor string
-		entityID         string
-		acsURL           string
-		errAssertion     require.ErrorAssertionFunc
-		expectedEntityID string
-		attributeMapping []*SAMLAttributeMapping
+		name               string
+		entityDescriptor   string
+		entityID           string
+		acsURL             string
+		errAssertion       require.ErrorAssertionFunc
+		expectedEntityID   string
+		attributeMapping   []*SAMLAttributeMapping
+		preset             string
+		relayState         string
+		expectedRelayState string
+		launchURLs         []string
 	}{
 		{
 			name:             "valid entity descriptor",
@@ -62,7 +69,7 @@ func TestNewSAMLIdPServiceProvider(t *testing.T) {
 		{
 			name:             "empty entity descriptor and entity ID",
 			entityDescriptor: "",
-			acsURL:           "https:/test.com/acs",
+			acsURL:           acsURL,
 			errAssertion: func(t require.TestingT, err error, i ...interface{}) {
 				require.ErrorIs(t, err, ErrEmptyEntityDescriptorAndEntityID)
 			},
@@ -79,7 +86,7 @@ func TestNewSAMLIdPServiceProvider(t *testing.T) {
 			name:             "empty entity descriptor with entity ID and ACS URL",
 			entityDescriptor: "",
 			entityID:         "IAMShowcase",
-			acsURL:           "https:/test.com/acs",
+			acsURL:           acsURL,
 			errAssertion:     require.NoError,
 			expectedEntityID: "IAMShowcase",
 		},
@@ -171,6 +178,85 @@ func TestNewSAMLIdPServiceProvider(t *testing.T) {
 				require.ErrorContains(t, err, "invalid name format")
 			},
 		},
+		{
+			name:             "supported empty preset value",
+			entityDescriptor: "",
+			entityID:         "IAMShowcase",
+			acsURL:           acsURL,
+			expectedEntityID: "IAMShowcase",
+			errAssertion:     require.NoError,
+			preset:           samlsp.GCPWorkforce,
+		},
+		{
+			name:             "supported unspecified preset value",
+			entityDescriptor: "",
+			entityID:         "IAMShowcase",
+			acsURL:           acsURL,
+			expectedEntityID: "IAMShowcase",
+			errAssertion:     require.NoError,
+			preset:           samlsp.Unspecified,
+		},
+		{
+			name:             "unsupported preset value",
+			entityDescriptor: "",
+			entityID:         "IAMShowcase",
+			acsURL:           acsURL,
+			expectedEntityID: "IAMShowcase",
+			errAssertion: func(t require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(t, err, "unsupported preset")
+			},
+			preset: "notsupported",
+		},
+		{
+			name:               "GCP Workforce user provided relay state",
+			entityID:           "IAMShowcase",
+			acsURL:             acsURL,
+			errAssertion:       require.NoError,
+			preset:             samlsp.GCPWorkforce,
+			relayState:         "user_provided_relay_state",
+			expectedRelayState: "user_provided_relay_state",
+		},
+		{
+			name:               "GCP Workforce default relay state",
+			entityID:           "IAMShowcase",
+			acsURL:             acsURL,
+			errAssertion:       require.NoError,
+			preset:             samlsp.GCPWorkforce,
+			expectedRelayState: samlsp.DefaultRelayStateGCPWorkforce,
+		},
+		{
+			name:               "default relay state should not be set for empty preset value",
+			entityID:           "IAMShowcase",
+			acsURL:             acsURL,
+			errAssertion:       require.NoError,
+			preset:             "",
+			expectedRelayState: "",
+		},
+		{
+			name:       "http launch url",
+			entityID:   "IAMShowcase",
+			acsURL:     acsURL,
+			launchURLs: []string{"http://test.com/myapp"},
+			errAssertion: func(t require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(t, err, "invalid scheme")
+			},
+		},
+		{
+			name:       "empty launch URLs",
+			entityID:   "IAMShowcase",
+			acsURL:     acsURL,
+			launchURLs: []string{""},
+			errAssertion: func(t require.TestingT, err error, i ...interface{}) {
+				require.ErrorContains(t, err, "invalid scheme")
+			},
+		},
+		{
+			name:         "valid launch URLs",
+			entityID:     "IAMShowcase",
+			acsURL:       acsURL,
+			launchURLs:   []string{"https://test.com/myapp", "https://anysubdomain.test.com/myapp"},
+			errAssertion: require.NoError,
+		},
 	}
 
 	for _, test := range tests {
@@ -182,13 +268,24 @@ func TestNewSAMLIdPServiceProvider(t *testing.T) {
 				EntityID:         test.entityID,
 				ACSURL:           test.acsURL,
 				AttributeMapping: test.attributeMapping,
+				Preset:           test.preset,
+				RelayState:       test.relayState,
+				LaunchURLs:       test.launchURLs,
 			})
 
 			test.errAssertion(t, err)
 			if sp != nil {
-				require.Equal(t, test.expectedEntityID, sp.GetEntityID())
+				if test.expectedEntityID != "" {
+					require.Equal(t, test.expectedEntityID, sp.GetEntityID())
+				}
 				if len(sp.GetAttributeMapping()) > 0 {
 					require.Equal(t, test.attributeMapping, sp.GetAttributeMapping())
+				}
+				if test.preset == "" && test.relayState == "" {
+					require.Empty(t, sp.GetRelayState())
+				}
+				if test.expectedRelayState != "" {
+					require.Equal(t, test.expectedRelayState, sp.GetRelayState())
 				}
 			}
 		})

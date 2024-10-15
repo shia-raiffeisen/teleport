@@ -36,6 +36,7 @@ import (
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/defaults"
+	clusterconfigpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/clusterconfig/v1"
 	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
 	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
@@ -44,6 +45,7 @@ import (
 	"github.com/gravitational/teleport/api/utils/keys"
 	dtauthz "github.com/gravitational/teleport/lib/devicetrust/authz"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/readonly"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
 
@@ -74,11 +76,12 @@ type DeviceAuthorizationOpts struct {
 
 // AuthorizerOpts holds creation options for [NewAuthorizer].
 type AuthorizerOpts struct {
-	ClusterName      string
-	AccessPoint      AuthorizerAccessPoint
-	MFAAuthenticator MFAAuthenticator
-	LockWatcher      *services.LockWatcher
-	Logger           logrus.FieldLogger
+	ClusterName         string
+	AccessPoint         AuthorizerAccessPoint
+	ReadOnlyAccessPoint ReadOnlyAuthorizerAccessPoint
+	MFAAuthenticator    MFAAuthenticator
+	LockWatcher         *services.LockWatcher
+	Logger              logrus.FieldLogger
 
 	// DeviceAuthorization holds Device Trust authorization options.
 	//
@@ -86,6 +89,9 @@ type AuthorizerOpts struct {
 	// support device trust to disable it.
 	// Most services should not set this field.
 	DeviceAuthorization DeviceAuthorizationOpts
+	// PermitCaching opts into the authorizer setting up its own internal
+	// caching when ReadOnlyAccessPoint is not provided.
+	PermitCaching bool
 }
 
 // NewAuthorizer returns new authorizer using backends
@@ -98,18 +104,43 @@ func NewAuthorizer(opts AuthorizerOpts) (Authorizer, error) {
 	}
 	logger := opts.Logger
 	if logger == nil {
-		logger = logrus.WithFields(logrus.Fields{trace.Component: "authorizer"})
+		logger = logrus.WithFields(logrus.Fields{teleport.ComponentKey: "authorizer"})
+	}
+
+	if opts.ReadOnlyAccessPoint == nil {
+		// we create the read-only access point if not provided in order to keep our
+		// code paths simpler, but the it will not perform ttl-caching unless opts.PermitCaching
+		// was set. This is necessary because the vast majority of our test coverage
+		// cannot handle caching, and will fail if caching is enabled.
+		var err error
+		opts.ReadOnlyAccessPoint, err = readonly.NewCache(readonly.CacheConfig{
+			Upstream: accessPointWrapper{opts.AccessPoint},
+			Disabled: !opts.PermitCaching,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	return &authorizer{
 		clusterName:             opts.ClusterName,
 		accessPoint:             opts.AccessPoint,
+		readOnlyAccessPoint:     opts.ReadOnlyAccessPoint,
 		mfaAuthenticator:        opts.MFAAuthenticator,
 		lockWatcher:             opts.LockWatcher,
 		logger:                  logger,
 		disableGlobalDeviceMode: opts.DeviceAuthorization.DisableGlobalMode,
 		disableRoleDeviceMode:   opts.DeviceAuthorization.DisableRoleMode,
 	}, nil
+}
+
+type accessPointWrapper struct {
+	AuthorizerAccessPoint
+}
+
+// GetAccessGraphSettings returns the access graph settings.
+func (accessPointWrapper) GetAccessGraphSettings(ctx context.Context) (*clusterconfigpb.AccessGraphSettings, error) {
+	return nil, trace.NotImplemented("GetAccessGraphSettings is not implemented")
 }
 
 // Authorizer authorizes identity and returns auth context
@@ -147,13 +178,27 @@ type AuthorizerAccessPoint interface {
 	GetCertAuthorities(ctx context.Context, caType types.CertAuthType, loadKeys bool) ([]types.CertAuthority, error)
 
 	// GetClusterAuditConfig returns cluster audit configuration.
-	GetClusterAuditConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterAuditConfig, error)
+	GetClusterAuditConfig(ctx context.Context) (types.ClusterAuditConfig, error)
 
 	// GetClusterNetworkingConfig returns cluster networking configuration.
-	GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error)
+	GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error)
 
 	// GetSessionRecordingConfig returns session recording configuration.
-	GetSessionRecordingConfig(ctx context.Context, opts ...services.MarshalOption) (types.SessionRecordingConfig, error)
+	GetSessionRecordingConfig(ctx context.Context) (types.SessionRecordingConfig, error)
+}
+
+// ReadOnlyAuthorizerAccessPoint is an additional optional access point interface that permits
+// optimized access-control checks by sharing references to frequently accessed configuration
+// objects across goroutines.
+type ReadOnlyAuthorizerAccessPoint interface {
+	// GetReadOnlyAuthPreference returns the cluster authentication configuration.
+	GetReadOnlyAuthPreference(ctx context.Context) (readonly.AuthPreference, error)
+
+	// GetReadOnlyClusterNetworkingConfig returns cluster networking configuration.
+	GetReadOnlyClusterNetworkingConfig(ctx context.Context) (readonly.ClusterNetworkingConfig, error)
+
+	// GetReadOnlySessionRecordingConfig returns session recording configuration.
+	GetReadOnlySessionRecordingConfig(ctx context.Context) (readonly.SessionRecordingConfig, error)
 }
 
 // MFAAuthenticator authenticates MFA responses.
@@ -175,11 +220,12 @@ type MFAAuthData struct {
 
 // authorizer creates new local authorizer
 type authorizer struct {
-	clusterName      string
-	accessPoint      AuthorizerAccessPoint
-	mfaAuthenticator MFAAuthenticator
-	lockWatcher      *services.LockWatcher
-	logger           logrus.FieldLogger
+	clusterName         string
+	accessPoint         AuthorizerAccessPoint
+	readOnlyAccessPoint ReadOnlyAuthorizerAccessPoint
+	mfaAuthenticator    MFAAuthenticator
+	lockWatcher         *services.LockWatcher
+	logger              logrus.FieldLogger
 
 	disableGlobalDeviceMode bool
 	disableRoleDeviceMode   bool
@@ -308,7 +354,7 @@ func (c *Context) WithExtraRoles(access services.RoleGetter, clusterName string,
 
 // GetAccessState returns the AccessState based on the underlying
 // [services.AccessChecker] and [tlsca.Identity].
-func (c *Context) GetAccessState(authPref types.AuthPreference) services.AccessState {
+func (c *Context) GetAccessState(authPref readonly.AuthPreference) services.AccessState {
 	state := c.Checker.GetAccessState(authPref)
 	identity := c.Identity.GetIdentity()
 
@@ -323,8 +369,46 @@ func (c *Context) GetAccessState(authPref types.AuthPreference) services.AccessS
 	return state
 }
 
+// GetDisconnectCertExpiry calculates the proper value for DisconnectExpiredCert
+// based on whether a connection is set to disconnect on cert expiry, and whether
+// the cert is a short-lived (<1m) one issued for an MFA verified session. If the session
+// doesn't need to be disconnected on cert expiry, it will return a zero [time.Time].
+func (c *Context) GetDisconnectCertExpiry(authPref readonly.AuthPreference) time.Time {
+	// In the case where both disconnect_expired_cert and require_session_mfa are enabled,
+	// the PreviousIdentityExpires value of the certificate will be used, which is the
+	// expiry of the certificate used to issue the short-lived MFA verified certificate.
+	//
+	// See https://github.com/gravitational/teleport/issues/18544
+
+	// If the session doesn't need to be disconnected on cert expiry just return the default value.
+	disconnectExpiredCert := authPref.GetDisconnectExpiredCert()
+	if c.Checker != nil {
+		disconnectExpiredCert = c.Checker.AdjustDisconnectExpiredCert(disconnectExpiredCert)
+	}
+
+	if !disconnectExpiredCert {
+		return time.Time{}
+	}
+
+	identity := c.Identity.GetIdentity()
+	if !identity.PreviousIdentityExpires.IsZero() {
+		// If this is a short-lived mfa verified cert, return the certificate extension
+		// that holds its issuing certificates expiry value.
+		return identity.PreviousIdentityExpires
+	}
+
+	// Otherwise, return the current certificates expiration
+	return identity.Expires
+}
+
 // Authorize authorizes user based on identity supplied via context
-func (a *authorizer) Authorize(ctx context.Context) (*Context, error) {
+func (a *authorizer) Authorize(ctx context.Context) (authCtx *Context, err error) {
+	defer func() {
+		if err != nil {
+			err = a.convertAuthorizerError(err)
+		}
+	}()
+
 	if ctx == nil {
 		return nil, trace.AccessDenied("missing authentication context")
 	}
@@ -342,7 +426,7 @@ func (a *authorizer) Authorize(ctx context.Context) (*Context, error) {
 	}
 
 	// Enforce applicable locks.
-	authPref, err := a.accessPoint.GetAuthPreference(ctx)
+	authPref, err := a.readOnlyAccessPoint.GetReadOnlyAuthPreference(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -371,7 +455,7 @@ func (a *authorizer) Authorize(ctx context.Context) (*Context, error) {
 	return authContext, nil
 }
 
-func (a *authorizer) enforcePrivateKeyPolicy(ctx context.Context, authContext *Context, authPref types.AuthPreference) error {
+func (a *authorizer) enforcePrivateKeyPolicy(ctx context.Context, authContext *Context, authPref readonly.AuthPreference) error {
 	switch authContext.Identity.(type) {
 	case BuiltinRole, RemoteBuiltinRole:
 		// built in roles do not need to pass private key policies
@@ -443,7 +527,7 @@ func (a *authorizer) isAdminActionAuthorizationRequired(ctx context.Context, aut
 		return false, nil
 	}
 
-	authpref, err := a.accessPoint.GetAuthPreference(ctx)
+	authpref, err := a.readOnlyAccessPoint.GetReadOnlyAuthPreference(ctx)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
@@ -484,12 +568,6 @@ func (a *authorizer) isAdminActionAuthorizationRequired(ctx context.Context, aut
 }
 
 func (a *authorizer) authorizeAdminAction(ctx context.Context, authContext *Context) error {
-	// Certain hardware-key based private key policies require MFA for each request.
-	if authContext.Identity.GetIdentity().PrivateKeyPolicy.MFAVerified() {
-		authContext.AdminActionAuthState = AdminActionAuthMFAVerified
-		return nil
-	}
-
 	// MFA is required to be passed through the request context.
 	mfaResp, err := mfa.CredentialsFromContext(ctx)
 	if err != nil {
@@ -516,6 +594,35 @@ func (a *authorizer) authorizeAdminAction(ctx context.Context, authContext *Cont
 	}
 
 	return nil
+}
+
+// convertAuthorizerError will take an authorizer error and convert it into an error easily
+// handled by gRPC services.
+func (a *authorizer) convertAuthorizerError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	// propagate connection problem error so we can differentiate
+	// between connection failed and access denied
+	case trace.IsConnectionProblem(err):
+		return trace.ConnectionProblem(err, "failed to connect to the database")
+	case trace.IsNotFound(err):
+		// user not found, wrap error with access denied
+		return trace.Wrap(err, "access denied")
+	case errors.Is(err, ErrIPPinningMissing) || errors.Is(err, ErrIPPinningMismatch) || errors.Is(err, ErrIPPinningNotAllowed):
+		a.logger.Warn(err)
+		return trace.Wrap(err)
+	case trace.IsAccessDenied(err):
+		// don't print stack trace, just log the warning
+		a.logger.Warn(err)
+	case keys.IsPrivateKeyPolicyError(err):
+		// private key policy errors should be returned to the client
+		// unaltered so that they know to reauthenticate with a valid key.
+		return trace.Unwrap(err)
+	default:
+		a.logger.WithError(err).Warn("Suppressing unknown authz error.")
+	}
+	return trace.AccessDenied("access denied")
 }
 
 // ErrIPPinningMissing is returned when user cert should be pinned but isn't.
@@ -669,7 +776,7 @@ func (a *authorizer) authorizeRemoteUser(ctx context.Context, u RemoteUser) (*Co
 
 // authorizeBuiltinRole authorizes builtin role
 func (a *authorizer) authorizeBuiltinRole(ctx context.Context, r BuiltinRole) (*Context, error) {
-	recConfig, err := a.accessPoint.GetSessionRecordingConfig(ctx)
+	recConfig, err := a.readOnlyAccessPoint.GetReadOnlySessionRecordingConfig(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -793,6 +900,7 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 				types.NewRule(types.KindWebSession, services.RW()),
 				types.NewRule(types.KindWebToken, services.RW()),
 				types.NewRule(types.KindKubeServer, services.RW()),
+				types.NewRule(types.KindKubeWaitingContainer, services.RW()),
 				types.NewRule(types.KindDatabaseServer, services.RO()),
 				types.NewRule(types.KindLock, services.RO()),
 				types.NewRule(types.KindToken, []string{types.VerbRead, types.VerbDelete}),
@@ -805,10 +913,13 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 				types.NewRule(types.KindSAMLIdPServiceProvider, services.RO()),
 				types.NewRule(types.KindUserGroup, services.RO()),
 				types.NewRule(types.KindClusterMaintenanceConfig, services.RO()),
+				types.NewRule(types.KindAutoUpdateConfig, services.RO()),
+				types.NewRule(types.KindAutoUpdateVersion, services.RO()),
 				types.NewRule(types.KindIntegration, append(services.RO(), types.VerbUse)),
 				types.NewRule(types.KindAuditQuery, services.RO()),
 				types.NewRule(types.KindSecurityReport, services.RO()),
 				types.NewRule(types.KindSecurityReportState, services.RO()),
+				types.NewRule(types.KindUserTask, services.RO()),
 				// this rule allows cloud proxies to read
 				// plugins of `openai` type, since Assist uses the OpenAI API and runs in Proxy.
 				{
@@ -842,7 +953,7 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 }
 
 // RoleSetForBuiltinRoles returns RoleSet for embedded builtin role
-func RoleSetForBuiltinRoles(clusterName string, recConfig types.SessionRecordingConfig, roles ...types.SystemRole) (services.RoleSet, error) {
+func RoleSetForBuiltinRoles(clusterName string, recConfig readonly.SessionRecordingConfig, roles ...types.SystemRole) (services.RoleSet, error) {
 	var definitions []types.Role
 	for _, role := range roles {
 		rd, err := definitionForBuiltinRole(clusterName, recConfig, role)
@@ -855,7 +966,7 @@ func RoleSetForBuiltinRoles(clusterName string, recConfig types.SessionRecording
 }
 
 // definitionForBuiltinRole constructs the appropriate role definition for a given builtin role.
-func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordingConfig, role types.SystemRole) (types.Role, error) {
+func definitionForBuiltinRole(clusterName string, recConfig readonly.SessionRecordingConfig, role types.SystemRole) (types.Role, error) {
 	switch role {
 	case types.RoleAuth:
 		return services.RoleFromSpec(
@@ -899,6 +1010,7 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindLock, services.RO()),
 						types.NewRule(types.KindNetworkRestrictions, services.RO()),
 						types.NewRule(types.KindConnectionDiagnostic, services.RW()),
+						types.NewRule(types.KindStaticHostUser, services.RO()),
 					},
 				},
 			})
@@ -959,6 +1071,8 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindSemaphore, services.RW()),
 						types.NewRule(types.KindLock, services.RO()),
 						types.NewRule(types.KindConnectionDiagnostic, services.RW()),
+						types.NewRule(types.KindDatabaseObjectImportRule, services.RO()),
+						types.NewRule(types.KindDatabaseObject, services.RW()),
 					},
 				},
 			})
@@ -1023,6 +1137,7 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 					KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
 					Rules: []types.Rule{
 						types.NewRule(types.KindKubeServer, services.RW()),
+						types.NewRule(types.KindKubeWaitingContainer, services.RW()),
 						types.NewRule(types.KindEvent, services.RW()),
 						types.NewRule(types.KindCertAuthority, services.ReadNoSecrets()),
 						types.NewRule(types.KindClusterName, services.RO()),
@@ -1074,13 +1189,16 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindCertAuthority, services.ReadNoSecrets()),
 						types.NewRule(types.KindClusterName, services.RO()),
 						types.NewRule(types.KindNamespace, services.RO()),
-						types.NewRule(types.KindNode, services.RO()),
+						types.NewRule(types.KindNode, services.RW()),
+						types.NewRule(types.KindKubeServer, services.RO()),
 						types.NewRule(types.KindKubernetesCluster, services.RW()),
 						types.NewRule(types.KindDatabase, services.RW()),
 						types.NewRule(types.KindServerInfo, services.RW()),
 						types.NewRule(types.KindApp, services.RW()),
 						types.NewRule(types.KindDiscoveryConfig, services.RO()),
 						types.NewRule(types.KindIntegration, append(services.RO(), types.VerbUse)),
+						types.NewRule(types.KindSemaphore, services.RW()),
+						types.NewRule(types.KindUserTask, services.RW()),
 					},
 					// Discovery service should only access kubes/apps/dbs that originated from discovery.
 					KubernetesLabels: types.Labels{types.OriginLabel: []string{types.OriginCloud}},
@@ -1111,6 +1229,7 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindClusterAuthPreference, services.RO()),
 						types.NewRule(types.KindRole, services.RO()),
 						types.NewRule(types.KindLock, services.RW()),
+						types.NewRule(types.KindSAML, services.ReadNoSecrets()),
 						// Okta can manage access lists and roles it creates.
 						{
 							Resources: []string{types.KindRole},
@@ -1142,13 +1261,28 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 					},
 				},
 			})
+
+	case types.RoleAccessGraphPlugin:
+		// RoleAccessGraphPlugin is a special role that is used by the Access Graph plugins
+		// to access the semaphore resource.
+		return services.RoleFromSpec(
+			role.String(),
+			types.RoleSpecV6{
+				Allow: types.RoleConditions{
+					Namespaces: []string{types.Wildcard},
+					Rules: []types.Rule{
+						types.NewRule(types.KindSemaphore, services.RW()),
+					},
+				},
+			})
+
 	}
 
 	return nil, trace.NotFound("builtin role %q is not recognized", role.String())
 }
 
 // ContextForBuiltinRole returns a context with the builtin role information embedded.
-func ContextForBuiltinRole(r BuiltinRole, recConfig types.SessionRecordingConfig) (*Context, error) {
+func ContextForBuiltinRole(r BuiltinRole, recConfig readonly.SessionRecordingConfig) (*Context, error) {
 	var systemRoles []types.SystemRole
 	if r.Role == types.RoleInstance {
 		// instance certs encode multiple system roles in a separate field
@@ -1337,80 +1471,41 @@ func ClientUserMetadataWithUser(ctx context.Context, user string) apievents.User
 	return meta
 }
 
-// ConvertAuthorizerError will take an authorizer error and convert it into an error easily
-// handled by gRPC services.
-func ConvertAuthorizerError(ctx context.Context, log logrus.FieldLogger, err error) error {
-	switch {
-	case err == nil:
-		return nil
-	// propagate connection problem error so we can differentiate
-	// between connection failed and access denied
-	case trace.IsConnectionProblem(err):
-		return trace.ConnectionProblem(err, "failed to connect to the database")
-	case trace.IsNotFound(err):
-		// user not found, wrap error with access denied
-		return trace.Wrap(err, "access denied")
-	case errors.Is(err, ErrIPPinningMissing) || errors.Is(err, ErrIPPinningMismatch) || errors.Is(err, ErrIPPinningNotAllowed):
-		log.Warn(err)
-		return trace.Wrap(err)
-	case trace.IsAccessDenied(err):
-		// don't print stack trace, just log the warning
-		log.Warn(err)
-	case keys.IsPrivateKeyPolicyError(err):
-		// private key policy errors should be returned to the client
-		// unaltered so that they know to reauthenticate with a valid key.
-		return trace.Unwrap(err)
-	default:
-		log.WithError(err).Warn("Suppressing unknown authz error.")
+// CheckAccessToKind will ensure that the user has access to the given verbs for the given kind.
+func (c *Context) CheckAccessToKind(kind string, verb string, additionalVerbs ...string) error {
+	ruleCtx := &services.Context{
+		User: c.User,
 	}
-	return trace.AccessDenied("access denied")
+
+	return c.CheckAccessToRule(ruleCtx, kind, verb, additionalVerbs...)
 }
 
-// AuthorizeResourceWithVerbs will ensure that the user has access to the given verbs for the given kind.
-func AuthorizeResourceWithVerbs(ctx context.Context, log logrus.FieldLogger, authorizer Authorizer, quiet bool, resource types.Resource, verbs ...string) (*Context, error) {
-	authCtx, err := authorizer.Authorize(ctx)
-	if err != nil {
-		return nil, ConvertAuthorizerError(ctx, log, err)
-	}
-
+// CheckAccessToResource will ensure that the user has access to the given verbs for the given resource.
+func (c *Context) CheckAccessToResource(resource types.Resource, verb string, additionalVerbs ...string) error {
 	ruleCtx := &services.Context{
-		User:     authCtx.User,
+		User:     c.User,
 		Resource: resource,
 	}
 
-	return AuthorizeContextWithVerbs(ctx, log, authCtx, quiet, ruleCtx, resource.GetKind(), verbs...)
+	return c.CheckAccessToRule(ruleCtx, resource.GetKind(), verb, additionalVerbs...)
 }
 
-// AuthorizeWithVerbs will ensure that the user has access to the given verbs for the given kind.
-func AuthorizeWithVerbs(ctx context.Context, log logrus.FieldLogger, authorizer Authorizer, quiet bool, kind string, verbs ...string) (*Context, error) {
-	authCtx, err := authorizer.Authorize(ctx)
-	if err != nil {
-		return nil, ConvertAuthorizerError(ctx, log, err)
+// CheckAccessToRule will ensure that the user has access to the given verbs for the given [services.Context] and kind.
+// Prefer to use [Context.CheckAccessToKind] or [Context.CheckAccessToResource] for common checks.
+func (c *Context) CheckAccessToRule(ruleCtx *services.Context, kind string, verb string, additionalVerbs ...string) error {
+	var errs []error
+	for _, verb := range append(additionalVerbs, verb) {
+		if err := c.Checker.CheckAccessToRule(ruleCtx, defaults.Namespace, kind, verb); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	ruleCtx := &services.Context{
-		User: authCtx.User,
-	}
-
-	return AuthorizeContextWithVerbs(ctx, log, authCtx, quiet, ruleCtx, kind, verbs...)
-}
-
-// AuthorizeContextWithVerbs will ensure that the user has access to the given verbs for the given services.context.
-func AuthorizeContextWithVerbs(ctx context.Context, log logrus.FieldLogger, authCtx *Context, quiet bool, ruleCtx *services.Context, kind string, verbs ...string) (*Context, error) {
-	errs := make([]error, len(verbs))
-	for i, verb := range verbs {
-		errs[i] = authCtx.Checker.CheckAccessToRule(ruleCtx, defaults.Namespace, kind, verb, quiet)
-	}
-
-	if err := trace.NewAggregate(errs...); err != nil {
-		return nil, err
-	}
-	return authCtx, nil
+	return trace.NewAggregate(errs...)
 }
 
 // AuthorizeAdminAction will ensure that the user is authorized to perform admin actions.
-func AuthorizeAdminAction(ctx context.Context, authCtx *Context) error {
-	switch authCtx.AdminActionAuthState {
+func (c *Context) AuthorizeAdminAction() error {
+	switch c.AdminActionAuthState {
 	case AdminActionAuthMFAVerified, AdminActionAuthNotRequired:
 		return nil
 	}
@@ -1419,11 +1514,11 @@ func AuthorizeAdminAction(ctx context.Context, authCtx *Context) error {
 
 // AuthorizeAdminActionAllowReusedMFA will ensure that the user is authorized to perform
 // admin actions. Additionally, MFA challenges that allow reuse will be accepted.
-func AuthorizeAdminActionAllowReusedMFA(ctx context.Context, authCtx *Context) error {
-	if authCtx.AdminActionAuthState == AdminActionAuthMFAVerifiedWithReuse {
+func (c *Context) AuthorizeAdminActionAllowReusedMFA() error {
+	if c.AdminActionAuthState == AdminActionAuthMFAVerifiedWithReuse {
 		return nil
 	}
-	return AuthorizeAdminAction(ctx, authCtx)
+	return c.AuthorizeAdminAction()
 }
 
 // LocalUser is a local user

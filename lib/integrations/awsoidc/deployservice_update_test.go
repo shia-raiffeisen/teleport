@@ -25,11 +25,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/automaticupgrades"
+	"github.com/gravitational/teleport/lib/integrations/awsoidc/tags"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestGenerateServiceWithTaskDefinition(t *testing.T) {
@@ -44,6 +46,8 @@ func TestGenerateServiceWithTaskDefinition(t *testing.T) {
 			},
 		},
 		PropagateTags: ecsTypes.PropagateTagsService,
+		CreatedBy:     aws.String("an extra field that is not present in the UpdateServiceInput"),
+		DesiredCount:  2,
 	}
 
 	expected := &ecs.UpdateServiceInput{
@@ -57,9 +61,15 @@ func TestGenerateServiceWithTaskDefinition(t *testing.T) {
 			},
 		},
 		PropagateTags: ecsTypes.PropagateTagsService,
-	}
+		DesiredCount:  aws.Int32(2),
 
-	require.Equal(t, expected, generateServiceWithTaskDefinition(service, "task-definition-v2"))
+		// Fields that are have a literal value in ecsTypes.Service but a pointer type in ecs.UpdateServiceInput will have their value defaulted to the 0-value
+		EnableECSManagedTags: aws.Bool(false),
+		EnableExecuteCommand: aws.Bool(false),
+	}
+	gotService, err := generateServiceWithTaskDefinition(service, "task-definition-v2")
+	require.NoError(t, err)
+	require.Equal(t, expected, gotService)
 }
 
 func TestGenerateTaskDefinitionWithImage(t *testing.T) {
@@ -70,6 +80,8 @@ func TestGenerateTaskDefinitionWithImage(t *testing.T) {
 		},
 		Cpu:    aws.String(taskCPU),
 		Memory: aws.String(taskMem),
+
+		RegisteredBy: aws.String("a field that doesn't exist in ecs.RegisterTaskDefinitionInput"),
 
 		NetworkMode:      ecsTypes.NetworkModeAwsvpc,
 		TaskRoleArn:      aws.String("task-role-arn"),
@@ -149,9 +161,11 @@ func TestUpdateDeployServices(t *testing.T) {
 
 	clusterName := "my-cluster"
 	integrationName := "my-integration"
-	ownershipTags := defaultResourceCreationTags(clusterName, integrationName)
-	teleportVersion := teleport.Version
-	log := logrus.WithField("test", t.Name())
+	ownershipTags := tags.DefaultResourceCreationTags(clusterName, integrationName)
+	semVer := *teleport.SemVersion
+	semVer.PreRelease = ""
+	teleportVersion := semVer.String()
+	log := utils.NewSlogLoggerForTests().With("test", t.Name())
 
 	t.Run("only legacy service present", func(t *testing.T) {
 		m := &mockDeployServiceClient{
@@ -375,4 +389,90 @@ func TestUpdateDeployServices(t *testing.T) {
 		require.Empty(t, m.services)
 		require.Empty(t, m.taskDefinitions)
 	})
+}
+
+func TestEnsureUpgraderEnvironmentVariables(t *testing.T) {
+	tts := []struct {
+		desc     string
+		env      []ecsTypes.KeyValuePair
+		expected []ecsTypes.KeyValuePair
+	}{
+		{
+			desc: "expected values are unmodified",
+			env: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String("EXAMPLE_ENV"),
+					Value: aws.String("EXAMPLE"),
+				},
+				{
+					Name:  aws.String(automaticupgrades.EnvUpgraderVersion),
+					Value: aws.String(teleport.Version),
+				},
+			},
+			expected: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String("EXAMPLE_ENV"),
+					Value: aws.String("EXAMPLE"),
+				},
+				{
+					Name:  aws.String(automaticupgrades.EnvUpgraderVersion),
+					Value: aws.String(teleport.Version),
+				},
+			},
+		},
+		{
+			desc: "Teleport upgrader env variables are added",
+			env: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String("EXAMPLE_ENV"),
+					Value: aws.String("EXAMPLE"),
+				},
+			},
+			expected: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String("EXAMPLE_ENV"),
+					Value: aws.String("EXAMPLE"),
+				},
+				{
+					Name:  aws.String(automaticupgrades.EnvUpgraderVersion),
+					Value: aws.String(teleport.Version),
+				},
+			},
+		},
+		{
+			desc: "Teleport upgrader env variables are updated",
+			env: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String("EXAMPLE_ENV"),
+					Value: aws.String("EXAMPLE"),
+				},
+				{
+					Name:  aws.String(automaticupgrades.EnvUpgraderVersion),
+					Value: aws.String("v1.0.0"),
+				},
+			},
+			expected: []ecsTypes.KeyValuePair{
+				{
+					Name:  aws.String("EXAMPLE_ENV"),
+					Value: aws.String("EXAMPLE"),
+				},
+				{
+					Name:  aws.String(automaticupgrades.EnvUpgraderVersion),
+					Value: aws.String(teleport.Version),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tts {
+		t.Run(tt.desc, func(t *testing.T) {
+			taskDefinition := &ecs.RegisterTaskDefinitionInput{
+				ContainerDefinitions: []ecsTypes.ContainerDefinition{
+					{Environment: tt.env},
+				},
+			}
+			require.NoError(t, ensureUpgraderEnvironmentVariables(taskDefinition))
+			require.Equal(t, tt.expected, taskDefinition.ContainerDefinitions[0].Environment)
+		})
+	}
 }

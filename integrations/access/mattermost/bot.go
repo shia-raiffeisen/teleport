@@ -20,6 +20,7 @@ package mattermost
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,7 +29,7 @@ import (
 
 	"github.com/go-resty/resty/v2"
 	"github.com/gravitational/trace"
-	"github.com/mailgun/holster/v3/collections"
+	lru "github.com/hashicorp/golang-lru/v2"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/accesslist"
@@ -58,6 +59,7 @@ var postTextTemplate = template.Must(template.New("description").Parse(
 {{else if eq .Status "PENDING"}}**Approve**: ` + "`tsh request review --approve {{.ID}}`" + `
 **Deny**: ` + "`tsh request review --deny {{.ID}}`" + `{{end}}`,
 ))
+
 var reviewCommentTemplate = template.Must(template.New("review comment").Parse(
 	`{{.Author}} reviewed the request at {{.Created.Format .TimeFormat}}.
 Resolution: {{.ProposedStateEmoji}} {{.ProposedState}}.
@@ -80,11 +82,14 @@ type Bot struct {
 	webProxyURL *url.URL
 }
 
-type getMeKey struct{}
-type getChannelByTeamNameAndNameKey struct {
-	team string
-	name string
-}
+type (
+	getMeKey                       struct{}
+	getChannelByTeamNameAndNameKey struct {
+		team string
+		name string
+	}
+)
+
 type getUserByEmail struct {
 	email string
 }
@@ -107,7 +112,10 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 		}
 	}
 
-	cache := collections.NewLRUCache(mmCacheSize)
+	cache, err := lru.New[any, etagCacheEntry](mmCacheSize)
+	if err != nil {
+		return Bot{}, trace.Wrap(err, "failed to create cache")
+	}
 
 	client := resty.
 		NewWithClient(&http.Client{
@@ -172,14 +180,9 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 			return nil
 		}
 
-		val, ok := cache.Get(cacheKey)
+		res, ok := cache.Get(cacheKey)
 		if !ok {
 			return nil
-		}
-
-		res, ok := val.(etagCacheEntry)
-		if !ok {
-			return trace.Errorf("etag cache entry of unknown type %T", val)
 		}
 
 		req.SetHeader("If-None-Match", res.etag)
@@ -240,7 +243,7 @@ func (b Bot) GetMe(ctx context.Context) (User, error) {
 }
 
 // SendReviewReminders will send a review reminder that an access list needs to be reviewed.
-func (b Bot) SendReviewReminders(ctx context.Context, recipients []common.Recipient, accessList *accesslist.AccessList) error {
+func (b Bot) SendReviewReminders(ctx context.Context, recipients []common.Recipient, accessLists []*accesslist.AccessList) error {
 	return trace.NotImplemented("access list review reminder is not yet implemented")
 }
 
@@ -371,6 +374,11 @@ func (b Bot) LookupDirectChannel(ctx context.Context, email string) (string, err
 	return channel.ID, nil
 }
 
+// NotifyUser will send users a direct message with the access request status
+func (b Bot) NotifyUser(ctx context.Context, reqID string, reqData pd.AccessRequestData) error {
+	return trace.NotImplemented("notify user not implemented for plugin")
+}
+
 func (b Bot) UpdateMessages(ctx context.Context, reqID string, reqData pd.AccessRequestData, mmData accessrequest.SentMessages, reviews []types.AccessReview) error {
 	text, err := b.buildPostText(reqID, reqData)
 	if err != nil {
@@ -457,7 +465,8 @@ func (b Bot) tryLookupDirectChannel(ctx context.Context, userEmail string) strin
 	log := logger.Get(ctx).WithField("mm_user_email", userEmail)
 	channel, err := b.LookupDirectChannel(ctx, userEmail)
 	if err != nil {
-		if errResult, ok := trace.Unwrap(err).(*ErrorResult); ok {
+		var errResult *ErrorResult
+		if errors.As(trace.Unwrap(err), &errResult) {
 			log.Warningf("Failed to lookup direct channel info: %q", errResult.Message)
 		} else {
 			log.WithError(err).Error("Failed to lookup direct channel info")
@@ -474,7 +483,8 @@ func (b Bot) tryLookupChannel(ctx context.Context, team, name string) string {
 	})
 	channel, err := b.LookupChannel(ctx, team, name)
 	if err != nil {
-		if errResult, ok := trace.Unwrap(err).(*ErrorResult); ok {
+		var errResult *ErrorResult
+		if errors.As(trace.Unwrap(err), &errResult) {
 			log.Warningf("Failed to lookup channel info: %q", errResult.Message)
 		} else {
 			log.WithError(err).Error("Failed to lookup channel info")

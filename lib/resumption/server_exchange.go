@@ -17,9 +17,11 @@
 package resumption
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/sha256"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
@@ -55,20 +57,20 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 	var dhBuf [ecdhP256UncompressedSize]byte
 	if _, err := io.ReadFull(conn, dhBuf[:]); err != nil {
 		if !utils.IsOKNetworkError(err) {
-			r.log.WithError(err).Error("Error while reading resumption handshake.")
+			slog.ErrorContext(context.TODO(), "error while reading resumption handshake", "error", err)
 		}
 		return
 	}
 
 	dhPub, err := ecdh.P256().NewPublicKey(dhBuf[:])
 	if err != nil {
-		r.log.WithError(err).Error("Received invalid ECDH key.")
+		slog.ErrorContext(context.TODO(), "received invalid ECDH key", "error", err)
 		return
 	}
 
 	dhSecret, err := dhKey.ECDH(dhPub)
 	if err != nil {
-		r.log.WithError(err).Error("Failed ECDH exchange.")
+		slog.ErrorContext(context.TODO(), "failed ECDH exchange", "error", err)
 		return
 	}
 
@@ -77,17 +79,17 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 	tag, err := conn.ReadByte()
 	if err != nil {
 		if !utils.IsOKNetworkError(err) {
-			r.log.WithError(err).Error("Error while reading resumption handshake.")
+			slog.ErrorContext(context.TODO(), "error while reading resumption handshake", "error", err)
 		}
 		return
 	}
 
 	switch tag {
 	default:
-		r.log.Error("Unknown tag in handshake: %x.", tag)
+		slog.ErrorContext(context.TODO(), "unknown tag in handshake", "tag", tag)
 		return
 	case newConnClientExchangeTag:
-		r.log.Info("Handling new resumable SSH connection.")
+		slog.InfoContext(context.TODO(), "handling new resumable SSH connection")
 
 		resumableConn := newResumableConn(conn.LocalAddr(), conn.RemoteAddr())
 		// nothing must use the resumable conn until the firstConn handler is
@@ -99,31 +101,39 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 			remoteIP, _ = netip.AddrFromSlice(t.IP)
 			remoteIP = remoteIP.Unmap()
 		}
-		if !remoteIP.IsValid() {
-			r.log.Warn("Tracking resumable connection with an invalid remote address (this is a bug).")
-		}
 
 		token := resumptionToken(otp32[:16])
-
-		r.mu.Lock()
 		entry := &connEntry{
 			conn:     resumableConn,
 			remoteIP: remoteIP,
 			timeout:  time.AfterFunc(detachedTimeout, func() { resumableConn.Close() }),
 		}
-		r.conns[token] = entry
-		r.mu.Unlock()
+
+		// this context is only used for the convenience of [context.AfterFunc]
+		handoverContext, handoverCancel := context.WithCancel(context.Background())
+		if remoteIP.IsValid() {
+			r.mu.Lock()
+			r.conns[token] = entry
+			r.mu.Unlock()
+
+			if err := r.startHandoverListener(handoverContext, token, entry); err != nil {
+				slog.WarnContext(context.TODO(), "unable to create handover listener for resumable connection, connection resumption will not work across graceful restarts", "error", err)
+			}
+		} else {
+			slog.WarnContext(context.TODO(), "refusing to track resumable connection with an invalid remote IP address, connection resumption will not work (this is a bug)")
+		}
 
 		go func() {
-			defer r.log.Info("Resumable connection completed.")
+			defer slog.InfoContext(context.TODO(), "resumable connection completed")
 			defer resumableConn.Close()
+			defer handoverCancel()
 			defer func() {
 				r.mu.Lock()
 				defer r.mu.Unlock()
 				delete(r.conns, token)
 			}()
 			defer entry.increaseRunning() // stop grace timeouts
-			r.log.Info("Handing resumable connection to the SSH server.")
+			slog.InfoContext(context.TODO(), "handing resumable connection to the SSH server")
 			r.sshServer(resumableConn)
 		}()
 
@@ -131,9 +141,9 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 		defer entry.decreaseRunning()
 		const firstConn = true
 		if err := runResumeV1Unlocking(resumableConn, conn, firstConn); utils.IsOKNetworkError(err) {
-			r.log.Debugf("Handling new resumable connection: %v", err.Error())
+			slog.DebugContext(context.TODO(), "handling new resumable connection", "error", err)
 		} else {
-			r.log.Warnf("Handling new resumable connection: %v", err.Error())
+			slog.WarnContext(context.TODO(), "handling new resumable connection", "error", err)
 		}
 		return
 	case existingConnClientExchangeTag:
@@ -142,7 +152,7 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 	var token resumptionToken
 	if _, err := io.ReadFull(conn, token[:]); err != nil {
 		if !utils.IsOKNetworkError(err) {
-			r.log.WithError(err).Error("Error while reading resumption handshake.")
+			slog.ErrorContext(context.TODO(), "error while reading resumption handshake", "error", err)
 		}
 		return
 	}
@@ -156,31 +166,29 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 	r.mu.Unlock()
 
 	if entry == nil {
-		r.log.Debug("Resumable connection not found or already deleted.")
-		_, _ = conn.Write([]byte{notFoundServerExchangeTag})
+		r.attemptHandover(conn, token)
 		return
 	}
 
-	if entry.remoteIP.IsValid() {
-		var remoteIP netip.Addr
-		if t, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-			remoteIP, _ = netip.AddrFromSlice(t.IP)
-		}
-		if entry.remoteIP != remoteIP.Unmap() {
-			r.log.Warn("Resumable connection attempted resumption from a different remote address.")
-			_, _ = conn.Write([]byte{badAddressServerExchangeTag})
-			return
-		}
-	} else {
-		r.log.Warn("Resumable connection attempted resumption on a connection with an invalid remote address.")
-		// the client can't recover from this, just send a "not found"
-		_, _ = conn.Write([]byte{notFoundServerExchangeTag})
+	var remoteIP netip.Addr
+	if t, _ := conn.RemoteAddr().(*net.TCPAddr); t != nil {
+		remoteIP, _ = netip.AddrFromSlice(t.IP)
+		remoteIP = remoteIP.Unmap()
+	}
+
+	r.resumeConnection(entry, conn, remoteIP)
+}
+
+func (r *SSHServerWrapper) resumeConnection(entry *connEntry, conn net.Conn, remoteIP netip.Addr) {
+	if entry.remoteIP != remoteIP {
+		slog.WarnContext(context.TODO(), "resumable connection attempted resumption from a different remote address")
+		_, _ = conn.Write([]byte{badAddressServerExchangeTag})
 		return
 	}
 
 	if _, err := conn.Write([]byte{successServerExchangeTag}); err != nil {
 		if !utils.IsOKNetworkError(err) {
-			r.log.WithError(err).Error("Error while writing resumption handshake.")
+			slog.ErrorContext(context.TODO(), "error while writing resumption handshake", "error", err)
 		}
 		return
 	}
@@ -190,8 +198,8 @@ func (r *SSHServerWrapper) handleResumptionExchangeV1(conn *multiplexer.Conn, dh
 	const notFirstConn = false
 	entry.conn.mu.Lock()
 	if err := runResumeV1Unlocking(entry.conn, conn, notFirstConn); utils.IsOKNetworkError(err) {
-		r.log.Debugf("Handling existing resumable connection: %v", err.Error())
+		slog.DebugContext(context.TODO(), "handling existing resumable connection", "error", err)
 	} else {
-		r.log.Warnf("Handling existing resumable connection: %v", err.Error())
+		slog.WarnContext(context.TODO(), "handling existing resumable connection", "error", err)
 	}
 }

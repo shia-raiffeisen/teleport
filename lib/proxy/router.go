@@ -24,13 +24,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 
 	"github.com/gravitational/trace"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 
@@ -40,7 +40,7 @@ import (
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/aws"
 	"github.com/gravitational/teleport/lib/agentless"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/observability/metrics"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
@@ -109,10 +109,12 @@ type SiteGetter interface {
 	GetSite(clusterName string) (reversetunnelclient.RemoteSite, error)
 }
 
-// RemoteClusterGetter provides access to remote cluster resources
-type RemoteClusterGetter interface {
+// LocalAccessPoint provides access to remote cluster resources
+type LocalAccessPoint interface {
 	// GetRemoteCluster returns a remote cluster by name
-	GetRemoteCluster(clusterName string) (types.RemoteCluster, error)
+	GetRemoteCluster(ctx context.Context, clusterName string) (types.RemoteCluster, error)
+	// GetAuthPreference returns the local cluster auth preference.
+	GetAuthPreference(context.Context) (types.AuthPreference, error)
 }
 
 // RouterConfig contains all the dependencies required
@@ -122,8 +124,8 @@ type RouterConfig struct {
 	ClusterName string
 	// Log is the logger to use
 	Log *logrus.Entry
-	// AccessPoint is the proxy cache
-	RemoteClusterGetter RemoteClusterGetter
+	// LocalAccessPoint is the proxy cache
+	LocalAccessPoint LocalAccessPoint
 	// SiteGetter allows looking up sites
 	SiteGetter SiteGetter
 	// TracerProvider allows tracers to be created
@@ -136,15 +138,15 @@ type RouterConfig struct {
 // CheckAndSetDefaults ensures the required items were populated
 func (c *RouterConfig) CheckAndSetDefaults() error {
 	if c.Log == nil {
-		c.Log = logrus.WithField(trace.Component, "Router")
+		c.Log = logrus.WithField(teleport.ComponentKey, "Router")
 	}
 
 	if c.ClusterName == "" {
 		return trace.BadParameter("ClusterName must be provided")
 	}
 
-	if c.RemoteClusterGetter == nil {
-		return trace.BadParameter("RemoteClusterGetter must be provided")
+	if c.LocalAccessPoint == nil {
+		return trace.BadParameter("LocalAccessPoint must be provided")
 	}
 
 	if c.SiteGetter == nil {
@@ -165,13 +167,13 @@ func (c *RouterConfig) CheckAndSetDefaults() error {
 // Router is used by the proxy to establish connections to both
 // nodes and other clusters.
 type Router struct {
-	clusterName    string
-	log            *logrus.Entry
-	clusterGetter  RemoteClusterGetter
-	localSite      reversetunnelclient.RemoteSite
-	siteGetter     SiteGetter
-	tracer         oteltrace.Tracer
-	serverResolver serverResolverFn
+	clusterName      string
+	log              *logrus.Entry
+	localAccessPoint LocalAccessPoint
+	localSite        reversetunnelclient.RemoteSite
+	siteGetter       SiteGetter
+	tracer           oteltrace.Tracer
+	serverResolver   serverResolverFn
 }
 
 // NewRouter creates and returns a Router that is populated
@@ -187,13 +189,13 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	return &Router{
-		clusterName:    cfg.ClusterName,
-		log:            cfg.Log,
-		clusterGetter:  cfg.RemoteClusterGetter,
-		localSite:      localSite,
-		siteGetter:     cfg.SiteGetter,
-		tracer:         cfg.TracerProvider.Tracer("Router"),
-		serverResolver: cfg.serverResolver,
+		clusterName:      cfg.ClusterName,
+		log:              cfg.Log,
+		localAccessPoint: cfg.LocalAccessPoint,
+		localSite:        localSite,
+		siteGetter:       cfg.SiteGetter,
+		tracer:           cfg.TracerProvider.Tracer("Router"),
+		serverResolver:   cfg.serverResolver,
 	}, nil
 }
 
@@ -214,17 +216,15 @@ func (r *Router) DialHost(ctx context.Context, clientSrcAddr, clientDstAddr net.
 	defer func() {
 		if err != nil {
 			failedConnectingToNode.Inc()
-			span.RecordError(trace.Unwrap(err))
-			span.SetStatus(codes.Error, err.Error())
 		}
-		span.End()
+		tracing.EndSpan(span, err)
 	}()
 
 	site := r.localSite
 	if clusterName != r.clusterName {
 		remoteSite, err := r.getRemoteCluster(ctx, clusterName, accessChecker)
 		if err != nil {
-			return nil, trace.Wrap(err)
+			return nil, trace.Wrap(err, "looking up remote cluster %q", clusterName)
 		}
 		site = remoteSite
 	}
@@ -279,7 +279,7 @@ func (r *Router) DialHost(ctx context.Context, clientSrcAddr, clientDstAddr net.
 				if err != nil {
 					return nil, trace.Wrap(err)
 				}
-				sshSigner, err = signer(ctx, client)
+				sshSigner, err = signer(ctx, r.localAccessPoint, client)
 				if err != nil {
 					return nil, trace.Wrap(err)
 				}
@@ -365,12 +365,12 @@ func (r *Router) getRemoteCluster(ctx context.Context, clusterName string, check
 
 	site, err := r.siteGetter.GetSite(clusterName)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, utils.OpaqueAccessDenied(err)
 	}
 
-	rc, err := r.clusterGetter.GetRemoteCluster(clusterName)
+	rc, err := r.localAccessPoint.GetRemoteCluster(ctx, clusterName)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, utils.OpaqueAccessDenied(err)
 	}
 
 	if err := checker.CheckAccessToRemoteCluster(rc); err != nil {
@@ -384,7 +384,7 @@ func (r *Router) getRemoteCluster(ctx context.Context, clusterName string, check
 // for a reversetunnelclient.RemoteSite. It makes testing easier.
 type site interface {
 	GetNodes(ctx context.Context, fn func(n services.Node) bool) ([]types.Server, error)
-	GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error)
+	GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error)
 }
 
 // remoteSite is a site implementation that wraps
@@ -404,19 +404,28 @@ func (r remoteSite) GetNodes(ctx context.Context, fn func(n services.Node) bool)
 }
 
 // GetClusterNetworkingConfig uses the wrapped sites cache to retrieve the ClusterNetworkingConfig
-func (r remoteSite) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
+func (r remoteSite) GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error) {
 	ap, err := r.site.CachingAccessPoint()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	cfg, err := ap.GetClusterNetworkingConfig(ctx, opts...)
+	cfg, err := ap.GetClusterNetworkingConfig(ctx)
 	return cfg, trace.Wrap(err)
 }
 
 // getServer attempts to locate a node matching the provided host and port in
 // the provided site.
 func getServer(ctx context.Context, host, port string, site site) (types.Server, error) {
+	return getServerWithResolver(ctx, host, port, site, nil /* use default resolver */)
+}
+
+var disableUnqualifiedLookups = os.Getenv("TELEPORT_UNSTABLE_DISABLE_UNQUALIFIED_LOOKUPS") == "yes"
+
+// getServerWithResolver attempts to locate a node matching the provided host and port in
+// the provided site. The resolver argument is used in certain tests to mock DNS resolution
+// and can generally be left nil.
+func getServerWithResolver(ctx context.Context, host, port string, site site, resolver apiutils.HostResolver) (types.Server, error) {
 	if site == nil {
 		return nil, trace.BadParameter("invalid remote site provided")
 	}
@@ -428,10 +437,28 @@ func getServer(ctx context.Context, host, port string, site site) (types.Server,
 		caseInsensitiveRouting = cfg.GetCaseInsensitiveRouting()
 	}
 
-	routeMatcher := apiutils.NewSSHRouteMatcher(host, port, caseInsensitiveRouting)
+	routeMatcher, err := apiutils.NewSSHRouteMatcherFromConfig(apiutils.SSHRouteMatcherConfig{
+		Host:                      host,
+		Port:                      port,
+		CaseInsensitive:           caseInsensitiveRouting,
+		Resolver:                  resolver,
+		DisableUnqualifiedLookups: disableUnqualifiedLookups,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 
+	var maxScore int
+	scores := make(map[string]int)
 	matches, err := site.GetNodes(ctx, func(server services.Node) bool {
-		return routeMatcher.RouteToServer(server)
+		score := routeMatcher.RouteToServerScore(server)
+		if score < 1 {
+			return false
+		}
+
+		scores[server.GetName()] = score
+		maxScore = max(maxScore, score)
+		return true
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -447,6 +474,21 @@ func getServer(ctx context.Context, host, port string, site site) (types.Server,
 				break
 			}
 		}
+	}
+
+	if len(matches) > 1 {
+		// in the event of multiple matches, some matches may be of higher quality than others
+		// (e.g. matching an ip/hostname directly versus matching a resolved ip). if we have a
+		// mix of match qualities, filter out the lower quality matches to reduce ambiguity.
+		filtered := matches[:0]
+		for _, m := range matches {
+			if scores[m.GetName()] < maxScore {
+				continue
+			}
+
+			filtered = append(filtered, m)
+		}
+		matches = filtered
 	}
 
 	var server types.Server
@@ -486,13 +528,7 @@ func (r *Router) DialSite(ctx context.Context, clusterName string, clientSrcAddr
 			attribute.String("cluster", clusterName),
 		),
 	)
-	defer func() {
-		if err != nil {
-			span.RecordError(trace.Unwrap(err))
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
+	defer func() { tracing.EndSpan(span, err) }()
 
 	// default to local cluster if one wasn't provided
 	if clusterName == "" {
@@ -520,7 +556,7 @@ func (r *Router) DialSite(ctx context.Context, clusterName string, clientSrcAddr
 }
 
 // GetSiteClient returns an auth client for the provided cluster.
-func (r *Router) GetSiteClient(ctx context.Context, clusterName string) (auth.ClientI, error) {
+func (r *Router) GetSiteClient(ctx context.Context, clusterName string) (authclient.ClientI, error) {
 	if clusterName == r.clusterName {
 		return r.localSite.GetClient()
 	}

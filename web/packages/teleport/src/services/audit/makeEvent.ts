@@ -93,7 +93,7 @@ export const formatters: Formatters = {
     type: 'access_request.search',
     desc: 'Resource Access Search',
     format: ({ user, resource_type, search_as_roles }) =>
-      `User [${user}] searched for resource type [${resource_type}] with role(s) [${search_as_roles}]`,
+      `User [${user}] searched for resource type [${resource_type}] with role(s) [${truncateStr(search_as_roles.join(','), 80)}]`,
   },
   [eventCodes.SESSION_COMMAND]: {
     type: 'session.command',
@@ -186,19 +186,19 @@ export const formatters: Formatters = {
   },
   [eventCodes.GITHUB_CONNECTOR_CREATED]: {
     type: 'github.created',
-    desc: 'GITHUB Auth Connector Created',
+    desc: 'GitHub Auth Connector Created',
     format: ({ user, name }) =>
       `User [${user}] created GitHub connector [${name}]`,
   },
   [eventCodes.GITHUB_CONNECTOR_DELETED]: {
     type: 'github.deleted',
-    desc: 'GITHUB Auth Connector Deleted',
+    desc: 'GitHub Auth Connector Deleted',
     format: ({ user, name }) =>
       `User [${user}] deleted GitHub connector [${name}]`,
   },
   [eventCodes.GITHUB_CONNECTOR_UPDATED]: {
     type: 'github.updated',
-    desc: 'GITHUB Auth Connector Updated',
+    desc: 'GitHub Auth Connector Updated',
     format: ({ user, name }) =>
       `User [${user}] updated GitHub connector [${name}]`,
   },
@@ -777,8 +777,12 @@ export const formatters: Formatters = {
   [eventCodes.CREATE_MFA_AUTH_CHALLENGE]: {
     type: 'mfa_auth_challenge.create',
     desc: 'MFA Authentication Attempt',
-    format: ({ user }) =>
-      `User [${user}] requested an MFA authentication challenge`,
+    format: ({ user }) => {
+      if (user) {
+        return `User [${user}] requested an MFA authentication challenge`;
+      }
+      return `Passwordless user requested an MFA authentication challenge`;
+    },
   },
   [eventCodes.VALIDATE_MFA_AUTH_RESPONSE]: {
     type: 'mfa_auth_challenge.validate',
@@ -895,10 +899,62 @@ export const formatters: Formatters = {
       )}] in database [${db_name}] on [${db_service}] failed`,
   },
   [eventCodes.DATABASE_SESSION_MALFORMED_PACKET]: {
-    type: 'db.session.malformed_packet"',
+    type: 'db.session.malformed_packet',
     desc: 'Database Malformed Packet',
     format: ({ user, db_service, db_name }) =>
       `Received malformed packet from [${user}] in [${db_name}] on database [${db_service}]`,
+  },
+  [eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE]: {
+    type: 'db.session.permissions.update',
+    desc: 'Database User Permissions Updated',
+    format: ({ user, db_service, db_name, permission_summary }) => {
+      if (!permission_summary) {
+        return `Database user [${user}] permissions updated for database [${db_name}] on [${db_service}]`;
+      }
+      const summary = permission_summary
+        .map(p => {
+          const details = Object.entries(p.counts)
+            .map(([key, value]) => `${key}:${value}`)
+            .join(',');
+          return `${p.permission}:${details}`;
+        })
+        .join('; ');
+      return `Database user [${user}] permissions updated for database [${db_name}] on [${db_service}]: ${summary}`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_CREATE]: {
+    type: 'db.session.user.create',
+    desc: 'Database User Created',
+    format: ev => {
+      if (!ev.roles) {
+        return `Database user [${ev.user}] created in database [${ev.db_service}]`;
+      }
+      return `Database user [${ev.user}] created in database [${ev.db_service}], roles: [${ev.roles}]`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE]: {
+    type: 'db.session.user.create',
+    desc: 'Database User Creation Failed',
+    format: ev => {
+      return `Failed to create database user [${ev.user}] in database [${ev.db_service}], error: [${ev.error}]`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE]: {
+    type: 'db.session.user.deactivate',
+    desc: 'Database User Deactivated',
+    format: ev => {
+      if (!ev.delete) {
+        return `Database user [${ev.user}] disabled in database [${ev.db_service}]`;
+      }
+      return `Database user [${ev.user}] deleted in database [${ev.db_service}]`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE]: {
+    type: 'db.session.user.deactivate',
+    desc: 'Database User Deactivate Failure',
+    format: ev => {
+      return `Failed to disable database user [${ev.user}] in database [${ev.db_service}], error: [${ev.error}]`;
+    },
   },
   [eventCodes.DATABASE_CREATED]: {
     type: 'db.create',
@@ -1208,10 +1264,10 @@ export const formatters: Formatters = {
   [eventCodes.DESKTOP_SESSION_STARTED]: {
     type: 'windows.desktop.session.start',
     desc: 'Windows Desktop Session Started',
-    format: ({ user, windows_domain, desktop_name, windows_user }) => {
-      let message = `User [${user}] has connected to Windows desktop [${windows_user}@${desktop_name}]`;
+    format: ({ user, windows_domain, desktop_name, sid, windows_user }) => {
+      let message = `User [${user}] started session ${sid} on Windows desktop [${windows_user}@${desktop_name}]`;
       if (windows_domain) {
-        message += ` on [${windows_domain}]`;
+        message += ` with domain [${windows_domain}]`;
       }
       return message;
     },
@@ -1222,7 +1278,7 @@ export const formatters: Formatters = {
     format: ({ user, windows_domain, desktop_name, windows_user }) => {
       let message = `User [${user}] was denied access to Windows desktop [${windows_user}@${desktop_name}]`;
       if (windows_domain) {
-        message += ` on [${windows_domain}]`;
+        message += ` with domain [${windows_domain}]`;
       }
       return message;
     },
@@ -1230,12 +1286,12 @@ export const formatters: Formatters = {
   [eventCodes.DESKTOP_SESSION_ENDED]: {
     type: 'windows.desktop.session.end',
     desc: 'Windows Desktop Session Ended',
-    format: ({ user, windows_domain, desktop_name, windows_user }) => {
+    format: ({ user, windows_domain, desktop_name, sid, windows_user }) => {
       let desktopMessage = `[${windows_user}@${desktop_name}]`;
       if (windows_domain) {
-        desktopMessage += ` on [${windows_domain}]`;
+        desktopMessage += ` with domain [${windows_domain}]`;
       }
-      let message = `Session for Windows desktop ${desktopMessage} has ended for user [${user}]`;
+      let message = `Session ${sid} for Windows desktop ${desktopMessage} has ended for user [${user}]`;
       return message;
     },
   },
@@ -1289,7 +1345,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_CREATE]: {
     type: 'device.create',
-    desc: 'Device Register',
+    desc: 'Device Registered',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has registered a device`
@@ -1297,7 +1353,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_DELETE]: {
     type: 'device.delete',
-    desc: 'Device Delete',
+    desc: 'Device Deleted',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has deleted a device`
@@ -1305,7 +1361,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_AUTHENTICATE]: {
     type: 'device.authenticate',
-    desc: 'Device Authenticate',
+    desc: 'Device Authenticated',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has successfully authenticated their device`
@@ -1313,7 +1369,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_ENROLL]: {
     type: 'device.enroll',
-    desc: 'Device Enrollment',
+    desc: 'Device Enrolled',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has successfully enrolled their device`
@@ -1321,7 +1377,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_ENROLL_TOKEN_CREATE]: {
     type: 'device.token.create',
-    desc: 'Device Enroll Token Create',
+    desc: 'Device Enroll Token Created',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] created a device enroll token`
@@ -1337,11 +1393,27 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_UPDATE]: {
     type: 'device.update',
-    desc: 'Device Update',
+    desc: 'Device Updated',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has updated a device`
         : `User [${user}] has failed to update a device`,
+  },
+  [eventCodes.DEVICE_WEB_TOKEN_CREATE]: {
+    type: 'device.webtoken.create',
+    desc: 'Device Web Token Created',
+    format: ({ user, status, success }) =>
+      success || (status && status.success)
+        ? `User [${user}] has issued a device web token`
+        : `User [${user}] has failed to issue a device web token`,
+  },
+  [eventCodes.DEVICE_AUTHENTICATE_CONFIRM]: {
+    type: 'device.authenticate.confirm',
+    desc: 'Device Web Authentication Confirmed',
+    format: ({ user, status, success }) =>
+      success || (status && status.success)
+        ? `User [${user}] has confirmed device web authentication`
+        : `User [${user}] has failed to confirm device web authentication`,
   },
   [eventCodes.X11_FORWARD]: {
     type: 'x11-forward',
@@ -1405,11 +1477,25 @@ export const formatters: Formatters = {
       return `Bot [${bot_name}] joined the cluster using the [${method}] join method`;
     },
   },
+  [eventCodes.BOT_JOIN_FAILURE]: {
+    type: 'bot.join',
+    desc: 'Bot Join Failed',
+    format: ({ bot_name }) => {
+      return `Bot [${bot_name || 'unknown'}] failed to join the cluster`;
+    },
+  },
   [eventCodes.INSTANCE_JOIN]: {
     type: 'instance.join',
     desc: 'Instance Joined',
     format: ({ node_name, role, method }) => {
       return `Instance [${node_name}] joined the cluster with the [${role}] role using the [${method}] join method`;
+    },
+  },
+  [eventCodes.INSTANCE_JOIN_FAILURE]: {
+    type: 'instance.join',
+    desc: 'Instance Join Failed',
+    format: ({ node_name }) => {
+      return `Instance [${node_name || 'unknown'}] failed to join the cluster`;
     },
   },
   [eventCodes.BOT_CREATED]: {
@@ -1551,6 +1637,17 @@ export const formatters: Formatters = {
     format: ({ name, source, user }) =>
       `Okta assignment [${name}], source [${source}], user [${user}] cleanup has failed`,
   },
+  [eventCodes.OKTA_USER_SYNC]: {
+    type: 'okta.user.sync',
+    desc: 'Okta user synchronization completed',
+    format: ({ num_users_created, num_users_modified, num_users_deleted }) =>
+      `[${num_users_created}] users added, [${num_users_modified}] users updated, [${num_users_deleted}] users deleted`,
+  },
+  [eventCodes.OKTA_USER_SYNC_FAILURE]: {
+    type: 'okta.user.sync',
+    desc: 'Okta user synchronization failed',
+    format: () => `Okta user synchronization failed`,
+  },
   [eventCodes.OKTA_ACCESS_LIST_SYNC]: {
     type: 'okta.access_list.sync',
     desc: 'Okta access list synchronization completed',
@@ -1607,7 +1704,7 @@ export const formatters: Formatters = {
     type: 'access_list.review',
     desc: 'Access list review failed',
     format: ({ name, updated_by }) =>
-      `User [${updated_by}] failed to to review access list [${name}]]`,
+      `User [${updated_by}] failed to to review access list [${name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_CREATE]: {
     type: 'access_list.member.create',
@@ -1695,6 +1792,163 @@ export const formatters: Formatters = {
     desc: 'External Audit Storage Disabled',
     format: ({ updated_by }) =>
       `User [${updated_by}] disabled External Audit Storage`,
+  },
+  [eventCodes.SPIFFE_SVID_ISSUED]: {
+    type: 'spiffe.svid.issued',
+    desc: 'SPIFFE SVID Issued',
+    format: ({ user, spiffe_id }) =>
+      `User [${user}] issued SPIFFE SVID [${spiffe_id}]`,
+  },
+  [eventCodes.SPIFFE_SVID_ISSUED_FAILURE]: {
+    type: 'spiffe.svid.issued',
+    desc: 'SPIFFE SVID Issued Failure',
+    format: ({ user, spiffe_id }) =>
+      `User [${user}] failed to issue SPIFFE SVID [${spiffe_id}]`,
+  },
+  [eventCodes.AUTH_PREFERENCE_UPDATE]: {
+    type: 'auth_preference.update',
+    desc: 'Cluster Authentication Preferences Updated',
+    format: ({ user }) =>
+      `User [${user}] updated the cluster authentication preferences`,
+  },
+  [eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE]: {
+    type: 'cluster_networking_config.update',
+    desc: 'Cluster Networking Configuration Updated',
+    format: ({ user }) =>
+      `User [${user}] updated the cluster networking configuration`,
+  },
+  [eventCodes.SESSION_RECORDING_CONFIG_UPDATE]: {
+    type: 'session_recording_config.update',
+    desc: 'Session Recording Configuration Updated',
+    format: ({ user }) =>
+      `User [${user}] updated the cluster session recording configuration`,
+  },
+  [eventCodes.ACCESS_GRAPH_PATH_CHANGED]: {
+    type: 'access_graph.path.changed',
+    desc: 'Access Path Changed',
+    format: ({
+      affected_resource_kind,
+      affected_resource_name,
+      affected_resource_source,
+    }) =>
+      `${affected_resource_kind || 'Node'} [${affected_resource_name}/${affected_resource_source}] changed an access path`,
+  },
+  [eventCodes.SPANNER_RPC]: {
+    type: 'db.session.spanner.rpc',
+    desc: 'Spanner RPC',
+    format: ({ args, user, procedure, db_name, db_service }) => {
+      if (args.sql) {
+        return `User [${user}] executed query [${truncateStr(
+          args.sql,
+          80
+        )}] in database [${db_name}] on [${db_service}]`;
+      }
+      return `User [${user}] called [${procedure}] in database [${db_name}] on [${db_service}]`;
+    },
+  },
+  [eventCodes.SPANNER_RPC_DENIED]: {
+    type: 'db.session.spanner.rpc',
+    desc: 'Spanner RPC Denied',
+    format: ({ args, user, procedure, db_name, db_service }) => {
+      if (args.sql) {
+        return `User [${user}] attempted to execute query [${truncateStr(
+          args.sql,
+          80
+        )}] in database [${db_name}] on [${db_service}]`;
+      }
+      return `User [${user}] attempted to call [${procedure}] in database [${db_name}] on [${db_service}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_CREATE]: {
+    type: 'discovery_config.create',
+    desc: 'Discovery Config Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a discovery config [${name}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_UPDATE]: {
+    type: 'discovery_config.update',
+    desc: 'Discovery Config Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a discovery config [${name}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_DELETE]: {
+    type: 'discovery_config.delete',
+    desc: 'Discovery Config Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a discovery config [${name}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_DELETE_ALL]: {
+    type: 'discovery_config.delete_all',
+    desc: 'All Discovery Configs Deleted',
+    format: ({ user }) => {
+      return `User [${user}] deleted all discovery configs`;
+    },
+  },
+  [eventCodes.INTEGRATION_CREATE]: {
+    type: 'integration.create',
+    desc: 'Integration Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created an integration [${name}]`;
+    },
+  },
+  [eventCodes.INTEGRATION_UPDATE]: {
+    type: 'integration.update',
+    desc: 'Integration Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated an integration [${name}]`;
+    },
+  },
+  [eventCodes.INTEGRATION_DELETE]: {
+    type: 'integration.delete',
+    desc: 'Integration Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted an integration [${name}]`;
+    },
+  },
+  [eventCodes.STATIC_HOST_USER_CREATE]: {
+    type: 'static_host_user.create',
+    desc: 'Static Host User Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a static host user [${name}]`;
+    },
+  },
+  [eventCodes.STATIC_HOST_USER_UPDATE]: {
+    type: 'static_host_user.update',
+    desc: 'Static Host User Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a static host user [${name}]`;
+    },
+  },
+  [eventCodes.STATIC_HOST_USER_DELETE]: {
+    type: 'static_host_user.delete',
+    desc: 'Static Host User Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a static host user [${name}]`;
+    },
+  },
+  [eventCodes.CROWN_JEWEL_CREATE]: {
+    type: 'access_graph.crown_jewel.create',
+    desc: 'Crown Jewel Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a crown jewel [${name}]`;
+    },
+  },
+  [eventCodes.CROWN_JEWEL_UPDATE]: {
+    type: 'access_graph.crown_jewel.update',
+    desc: 'Crown Jewel Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a crown jewel [${name}]`;
+    },
+  },
+  [eventCodes.CROWN_JEWEL_DELETE]: {
+    type: 'access_graph.crown_jewel.delete',
+    desc: 'Crown Jewel Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a crown jewel [${name}]`;
+    },
   },
   [eventCodes.UNKNOWN]: {
     type: 'unknown',

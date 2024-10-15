@@ -49,7 +49,7 @@ export function AuthDeviceList({
       <Row>{header}</Row>
       {devices.length > 0 && (
         <Row>
-          <StyledTable<MfaDevice>
+          <StyledTable
             columns={[
               {
                 key: 'description',
@@ -72,9 +72,14 @@ export function AuthDeviceList({
               {
                 altKey: 'remove-btn',
                 headerText: 'Actions',
-                render: device => (
-                  <RemoveCell onRemove={() => onRemove(device)} />
-                ),
+                render: device => {
+                  return (
+                    <RemoveCell
+                      isSsoDevice={device.type === 'sso'}
+                      onRemove={() => onRemove(device)}
+                    />
+                  );
+                },
               },
             ]}
             data={devices}
@@ -93,42 +98,28 @@ export function AuthDeviceList({
 
 interface RemoveCellProps {
   onRemove?: () => void;
+  isSsoDevice?: boolean;
 }
 
-function RemoveCell({ onRemove }: RemoveCellProps) {
+function RemoveCell({ onRemove, isSsoDevice }: RemoveCellProps) {
   return (
-    <Cell>
-      <ButtonWarningBorder p={2} onClick={onRemove}>
+    <Cell data-testid="delete-device">
+      <ButtonWarningBorder
+        disabled={isSsoDevice}
+        title={isSsoDevice ? 'SSO device cannot be deleted' : 'Delete'}
+        p={2}
+        onClick={onRemove}
+      >
         <Icon.Trash size="small" />
       </ButtonWarningBorder>
     </Cell>
   );
 }
 
-const StyledTable = styled(Table)(
-  props => `
-  background-color: transparent;
-
-  & > tbody > tr > td, thead > tr > th {
-    font-size: ${props.theme.fontSizes[2]}px;
+const StyledTable = styled(Table<MfaDevice>)`
+  & > tbody > tr > td,
+  thead > tr > th {
     font-weight: 300;
+    padding-bottom: ${props => props.theme.space[2]}px;
   }
-
-  & > thead > tr > th {
-    text-transform: none;
-    padding-top: ${props.theme.space[2]}px;
-    padding-bottom: ${props.theme.space[2]}px;
-
-    &:first-child {
-      border-radius: ${props.theme.radii[2]}px 0 0 ${props.theme.radii[2]}px;
-    }
-    &:last-child {
-      border-radius: 0 ${props.theme.radii[2]}px ${props.theme.radii[2]}px 0;
-    }
-  }
-
-  & > tbody > tr {
-    border: none;
-  }
-`
-);
+`;

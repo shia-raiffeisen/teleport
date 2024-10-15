@@ -20,7 +20,6 @@ export { ActionButtons, AlternateInstructionButton } from './ActionButtons';
 export { ButtonBlueText } from './ButtonBlueText';
 export { Header, HeaderSubtitle, HeaderWithBackBtn } from './Header';
 export { Finished } from './Finished';
-export { Mark } from './Mark';
 export { PermissionsErrorMessage } from '../SelectResource/PermissionsErrorMessage';
 export { ResourceKind } from './ResourceKind';
 export { Step, StepContainer } from './Step';
@@ -33,7 +32,10 @@ export {
 export { useShowHint } from './useShowHint';
 export { StepBox } from './StepBox';
 export { SecurityGroupPicker } from './SecurityGroupPicker';
-export type { ViewRulesSelection } from './SecurityGroupPicker';
+export type {
+  ViewRulesSelection,
+  SecurityGroupWithRecommendation,
+} from './SecurityGroupPicker';
 export { AwsAccount } from './AwsAccount';
 export { StatusLight, ItemStatus } from './StatusLight';
 export {

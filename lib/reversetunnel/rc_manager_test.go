@@ -28,9 +28,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -167,7 +166,7 @@ func TestRemoteClusterTunnelManagerSync(t *testing.T) {
 				cmp.Comparer(func(a, b *AgentPool) bool {
 					aAddr, aMode, aErr := a.AgentPoolConfig.Resolver(context.Background())
 					bAddr, bMode, bErr := b.AgentPoolConfig.Resolver(context.Background())
-					if aAddr != bAddr && aMode != bMode && aErr != bErr {
+					if aAddr != bAddr && aMode != bMode && !errors.Is(bErr, aErr) {
 						return false
 					}
 
@@ -183,13 +182,13 @@ func TestRemoteClusterTunnelManagerSync(t *testing.T) {
 }
 
 type mockAuthClient struct {
-	auth.ClientI
+	authclient.ClientI
 
 	reverseTunnels    []types.ReverseTunnel
 	reverseTunnelsErr error
 }
 
-func (c mockAuthClient) GetReverseTunnels(context.Context, ...services.MarshalOption) ([]types.ReverseTunnel, error) {
+func (c mockAuthClient) GetReverseTunnels(context.Context) ([]types.ReverseTunnel, error) {
 	return c.reverseTunnels, c.reverseTunnelsErr
 }
 

@@ -21,7 +21,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
 )
 
@@ -120,16 +119,6 @@ func (c *TrustedClusterV2) GetSubKind() string {
 // SetSubKind sets resource subkind
 func (c *TrustedClusterV2) SetSubKind(s string) {
 	c.SubKind = s
-}
-
-// GetResourceID returns resource ID
-func (c *TrustedClusterV2) GetResourceID() int64 {
-	return c.Metadata.ID
-}
-
-// SetResourceID sets resource ID
-func (c *TrustedClusterV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
 }
 
 // GetRevision returns the revision
@@ -259,9 +248,8 @@ func (c *TrustedClusterV2) CanChangeStateTo(t TrustedCluster) error {
 	if !slices.Equal(c.GetRoles(), t.GetRoles()) {
 		return immutableFieldErr("roles")
 	}
-	roleMapUpdated := !cmp.Equal(c.GetRoleMap(), t.GetRoleMap())
 
-	if c.GetEnabled() == t.GetEnabled() && !roleMapUpdated {
+	if c.GetEnabled() == t.GetEnabled() && c.GetRoleMap().IsEqual(t.GetRoleMap()) {
 		if t.GetEnabled() {
 			return trace.AlreadyExists("leaf cluster is already enabled, this update would have no effect")
 		}
@@ -279,6 +267,13 @@ func (c *TrustedClusterV2) String() string {
 
 // RoleMap is a list of mappings
 type RoleMap []RoleMapping
+
+// IsEqual validates that two roles maps are equivalent.
+func (r RoleMap) IsEqual(other RoleMap) bool {
+	return slices.EqualFunc(r, other, func(a RoleMapping, b RoleMapping) bool {
+		return a.Remote == b.Remote && slices.Equal(a.Local, b.Local)
+	})
+}
 
 // SortedTrustedCluster sorts clusters by name
 type SortedTrustedCluster []TrustedCluster

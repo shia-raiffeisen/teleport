@@ -45,8 +45,9 @@ func convertError(err error) error {
 		Cause() error
 	}
 
-	if causer, ok := err.(causer); ok {
-		return trace.Wrap(causer.Cause())
+	var c causer
+	if errors.As(err, &c) {
+		return trace.Wrap(c.Cause())
 	}
 
 	return trace.Wrap(err)
@@ -71,7 +72,7 @@ func (p *MySQLPinger) Ping(ctx context.Context, params PingParams) error {
 	}
 
 	defer func() {
-		if err := conn.Close(); err != nil {
+		if err := conn.Quit(); err != nil {
 			logrus.WithError(err).Info("Failed to close connection in MySQLPinger.Ping")
 		}
 	}()

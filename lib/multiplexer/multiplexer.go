@@ -28,10 +28,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/x509"
+	"crypto"
 	"errors"
-	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -45,8 +45,8 @@ import (
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/jwt"
 	"github.com/gravitational/teleport/lib/loglimit"
-	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 var (
@@ -97,6 +97,9 @@ type Config struct {
 	Clock clockwork.Clock
 	// PROXYProtocolMode controls behavior related to unsigned PROXY protocol headers.
 	PROXYProtocolMode PROXYProtocolMode
+	// SuppressUnexpectedPROXYWarning makes multiplexer not issue warnings if it receives PROXY
+	// line when running in PROXYProtocolMode=PROXYProtocolUnspecified
+	SuppressUnexpectedPROXYWarning bool
 	// ID is an identifier used for debugging purposes
 	ID string
 	// CertAuthorityGetter is used to get CA to verify singed PROXY headers sent internally by teleport
@@ -155,7 +158,7 @@ func New(cfg Config) (*Mux, error) {
 	waitContext, waitCancel := context.WithCancel(context.TODO())
 	return &Mux{
 		Entry: log.WithFields(log.Fields{
-			trace.Component: teleport.Component("mx", cfg.ID),
+			teleport.ComponentKey: teleport.Component("mx", cfg.ID),
 		}),
 		Config:      cfg,
 		context:     ctx,
@@ -171,13 +174,14 @@ type Mux struct {
 	sync.RWMutex
 	*log.Entry
 	Config
-	sshListener *Listener
-	tlsListener *Listener
-	dbListener  *Listener
-	context     context.Context
-	cancel      context.CancelFunc
-	waitContext context.Context
-	waitCancel  context.CancelFunc
+	sshListener  *Listener
+	tlsListener  *Listener
+	dbListener   *Listener
+	httpListener *Listener
+	context      context.Context
+	cancel       context.CancelFunc
+	waitContext  context.Context
+	waitCancel   context.CancelFunc
 	// logLimiter is a goroutine responsible for deduplicating multiplexer errors
 	// (over a 1min window) that occur when detecting the types of new connections.
 	// This ensures that health checkers / malicious actors cannot overpower /
@@ -214,6 +218,16 @@ func (m *Mux) DB() net.Listener {
 		m.dbListener = newListener(m.context, m.Config.Listener.Addr())
 	}
 	return m.dbListener
+}
+
+// HTTP returns listener that receives plain HTTP connections
+func (m *Mux) HTTP() net.Listener {
+	m.Lock()
+	defer m.Unlock()
+	if m.httpListener == nil {
+		m.httpListener = newListener(m.context, m.Config.Listener.Addr())
+	}
+	return m.httpListener
 }
 
 func (m *Mux) closeListener() {
@@ -287,6 +301,9 @@ func (m *Mux) protocolListener(proto Protocol) *Listener {
 		return m.sshListener
 	case ProtoPostgres:
 		return m.dbListener
+	case ProtoHTTP:
+		return m.httpListener
+
 	}
 	return nil
 }
@@ -321,7 +338,7 @@ func (m *Mux) detectAndForward(conn net.Conn) {
 
 	connWrapper, err := m.detect(conn)
 	if err != nil {
-		if trace.Unwrap(err) != io.EOF {
+		if !errors.Is(trace.Unwrap(err), io.EOF) {
 			m.logLimiter.Log(m.Entry.WithFields(log.Fields{
 				"src_addr": conn.RemoteAddr(),
 				"dst_addr": conn.LocalAddr(),
@@ -466,10 +483,8 @@ const (
 	invalidProxyLineError                 = "invalid PROXY line"
 	invalidProxyV2LineError               = "invalid PROXY v2 line"
 	invalidProxySignatureError            = "could not verify PROXY signature for connection"
-	missingProxyLineError                 = `connection (%s -> %s) rejected because PROXY protocol is enabled but required
-PROXY protocol line wasn't received. 
-Make sure you have correct configuration, only enable "proxy_protocol: on" in config if Teleport is running behind L4 
-load balancer with enabled PROXY protocol.`
+	missingProxyLineError                 = `connection (%s -> %s) rejected: PROXY protocol required, but PROXY protocol line not received. Please verify your configuration. 
+Enable "proxy_protocol: on" only if Teleport is behind an L4 load balancer with PROXY protocol enabled.`
 	unknownProtocolError     = "unknown protocol"
 	unexpectedPROXYLineError = `received unexpected PROXY protocol line. Connection will be allowed, but this is usually a result of misconfiguration - 
 if Teleport is running behind L4 load balancer with enabled PROXY protocol you should explicitly set config field "proxy_protocol" to "on".
@@ -511,7 +526,7 @@ func (m *Mux) detect(conn net.Conn) (*Conn, error) {
 			}
 			unsignedPROXYLineReceived = true
 
-			if m.PROXYProtocolMode == PROXYProtocolUnspecified {
+			if m.PROXYProtocolMode == PROXYProtocolUnspecified && !m.SuppressUnexpectedPROXYWarning {
 				m.logLimiter.Log(m.WithFields(log.Fields{
 					"direct_src_addr": conn.RemoteAddr(),
 					"direct_dst_addr": conn.LocalAddr(),
@@ -589,7 +604,7 @@ func (m *Mux) detect(conn net.Conn) (*Conn, error) {
 			}
 			unsignedPROXYLineReceived = true
 
-			if m.PROXYProtocolMode == PROXYProtocolUnspecified {
+			if m.PROXYProtocolMode == PROXYProtocolUnspecified && !m.SuppressUnexpectedPROXYWarning {
 				m.logLimiter.Log(m.WithFields(log.Fields{
 					"direct_src_addr": conn.RemoteAddr(),
 					"direct_dst_addr": conn.LocalAddr(),
@@ -638,30 +653,29 @@ func (m *Mux) checkPROXYProtocolRequirement(conn net.Conn, unsignedPROXYLineRece
 		return trace.Wrap(err)
 	}
 
-	// We try to get inner multiplexer connection, if we succeed and there is on, it means conn was passed
-	// to us from another multiplexer listener and unsigned PROXY protocol requirement was handled there.
-	innerConn := unwrapMuxConn(conn)
-
-	if !selfConnection && innerConn == nil && !unsignedPROXYLineReceived {
+	if !selfConnection && !isInternalConn(conn) && !unsignedPROXYLineReceived {
 		return trace.BadParameter(missingProxyLineError, conn.RemoteAddr().String(), conn.LocalAddr().String())
 	}
 
 	return nil
 }
 
-func unwrapMuxConn(conn net.Conn) *Conn {
+// isInternalConn determines if the connection is a multiplexer Conn.
+// If the check is successful, it indicates that the connection was provided by another multiplexer listener,
+// and that the unsigned PROXY protocol requirement has already been handled.
+func isInternalConn(conn net.Conn) bool {
 	type netConn interface {
 		NetConn() net.Conn
 	}
 
 	for {
-		if muxConn, ok := conn.(*Conn); ok {
-			return muxConn
+		if _, ok := conn.(*Conn); ok {
+			return true
 		}
 
 		connGetter, ok := conn.(netConn)
 		if !ok {
-			return nil
+			return false
 		}
 		conn = connGetter.NetConn()
 	}
@@ -818,37 +832,61 @@ type PROXYHeaderSigner interface {
 
 // PROXYSigner implements PROXYHeaderSigner to sign PROXY headers
 type PROXYSigner struct {
-	signingCertDER []byte
+	getCertificate utils.GetCertificateFunc
+	clock          clockwork.Clock
 	clusterName    string
-	jwtSigner      JWTPROXYSigner
 }
 
 // NewPROXYSigner returns a new instance of PROXYSigner
-func NewPROXYSigner(signingCert *x509.Certificate, jwtSigner JWTPROXYSigner) (*PROXYSigner, error) {
-	identity, err := tlsca.FromSubject(signingCert.Subject, signingCert.NotAfter)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if ok := checkForSystemRole(identity, types.RoleProxy); !ok {
-		return nil, trace.Wrap(ErrIncorrectRole)
-	}
-
+func NewPROXYSigner(clusterName string, getCertificate utils.GetCertificateFunc, clock clockwork.Clock) (*PROXYSigner, error) {
 	return &PROXYSigner{
-		signingCertDER: signingCert.Raw,
-		clusterName:    identity.TeleportCluster,
-		jwtSigner:      jwtSigner,
+		getCertificate: getCertificate,
+		clock:          clock,
+		clusterName:    clusterName,
 	}, nil
 }
 
 // SignPROXYHeader creates a signed PROXY header with provided source and destination addresses
 func (p *PROXYSigner) SignPROXYHeader(source, destination net.Addr) ([]byte, error) {
-	header, err := signPROXYHeader(source, destination, p.clusterName, p.signingCertDER, p.jwtSigner)
-	if err == nil {
-		log.WithFields(log.Fields{
-			"src_addr":     fmt.Sprintf("%v", source),
-			"dst_addr":     fmt.Sprintf("%v", destination),
-			"cluster_name": p.clusterName}).Trace("Successfully generated signed PROXY header")
+	cert, err := p.getCertificate()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return header, trace.Wrap(err)
+	if len(cert.Certificate) < 1 {
+		return nil, trace.Errorf("missing certificate for PROXY header signature")
+	}
+	if len(cert.Certificate) > 1 {
+		return nil, trace.Errorf("PROXY header signatures only support one certificate, got a chain of %v", len(cert.Certificate))
+	}
+	signingCert := cert.Certificate[0]
+
+	signer, ok := cert.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, trace.Errorf("expected certificate private key to be a crypto.Signer, got %T", cert.PrivateKey)
+	}
+
+	jwtKey, err := jwt.New(&jwt.Config{
+		Clock:       p.clock,
+		PrivateKey:  signer,
+		ClusterName: p.clusterName,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	header, err := signPROXYHeader(source, destination, p.clusterName, signingCert, jwtKey)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if slog.Default().Enabled(context.Background(), logutils.TraceLevel) {
+		slog.LogAttrs(context.Background(), logutils.TraceLevel,
+			"Successfully signed PROXY header.",
+			slog.Any("src_addr", logutils.StringerAttr(source)),
+			slog.Any("dst_addr", logutils.StringerAttr(destination)),
+			slog.String("src_addr", p.clusterName),
+		)
+	}
+
+	return header, nil
 }

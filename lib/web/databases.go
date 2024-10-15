@@ -35,24 +35,31 @@ import (
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/tlsutils"
-	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
 	dbiam "github.com/gravitational/teleport/lib/srv/db/common/iam"
+	"github.com/gravitational/teleport/lib/ui"
+	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/web/scripts"
-	"github.com/gravitational/teleport/lib/web/ui"
+	webui "github.com/gravitational/teleport/lib/web/ui"
 )
 
-// createDatabaseRequest contains the necessary basic information to create a database.
-// Database here is the database resource, containing information to a real database (protocol, uri)
-type createDatabaseRequest struct {
+// createOrOverwriteDatabaseRequest contains the necessary basic information
+// to create (or overwrite) a database.
+// Database here is the database resource, containing information to a real
+// database (protocol, uri).
+type createOrOverwriteDatabaseRequest struct {
 	Name     string     `json:"name,omitempty"`
 	Labels   []ui.Label `json:"labels,omitempty"`
 	Protocol string     `json:"protocol,omitempty"`
 	URI      string     `json:"uri,omitempty"`
 	AWSRDS   *awsRDS    `json:"awsRds,omitempty"`
+	// Overwrite will replace an existing db resource
+	// with a new db resource. Only the name cannot
+	// be changed.
+	Overwrite bool `json:"overwrite,omitempty"`
 }
 
 type awsRDS struct {
@@ -62,7 +69,7 @@ type awsRDS struct {
 	VPCID      string   `json:"vpcId,omitempty"`
 }
 
-func (r *createDatabaseRequest) checkAndSetDefaults() error {
+func (r *createOrOverwriteDatabaseRequest) checkAndSetDefaults() error {
 	if r.Name == "" {
 		return trace.BadParameter("missing database name")
 	}
@@ -94,9 +101,9 @@ func (r *createDatabaseRequest) checkAndSetDefaults() error {
 }
 
 // handleDatabaseCreate creates a database's metadata.
-func (h *Handler) handleDatabaseCreate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
-	var req *createDatabaseRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
+func (h *Handler) handleDatabaseCreateOrOverwrite(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
+	var req *createOrOverwriteDatabaseRequest
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -114,11 +121,20 @@ func (h *Handler) handleDatabaseCreate(w http.ResponseWriter, r *http.Request, p
 		return nil, trace.Wrap(err)
 	}
 
-	if err := clt.CreateDatabase(r.Context(), database); err != nil {
-		if trace.IsAlreadyExists(err) {
-			return nil, trace.AlreadyExists("failed to create database (%q already exists), please use another name", req.Name)
+	if req.Overwrite {
+		if _, err := clt.GetDatabase(r.Context(), req.Name); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return nil, trace.Wrap(err)
+		if err := clt.UpdateDatabase(r.Context(), database); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	} else {
+		if err := clt.CreateDatabase(r.Context(), database); err != nil {
+			if trace.IsAlreadyExists(err) {
+				return nil, trace.AlreadyExists("failed to create database (%q already exists), please use another name", req.Name)
+			}
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	accessChecker, err := sctx.GetUserAccessChecker()
@@ -130,7 +146,7 @@ func (h *Handler) handleDatabaseCreate(w http.ResponseWriter, r *http.Request, p
 		return nil, trace.Wrap(err)
 	}
 
-	return ui.MakeDatabase(database, dbUsers, dbNames), nil
+	return webui.MakeDatabase(database, dbUsers, dbNames, false /* requiresRequest */), nil
 }
 
 // updateDatabaseRequest contains some updatable fields of a database resource.
@@ -170,14 +186,14 @@ func (r *updateDatabaseRequest) checkAndSetDefaults() error {
 }
 
 // handleDatabaseUpdate updates the database
-func (h *Handler) handleDatabaseUpdate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
+func (h *Handler) handleDatabasePartialUpdate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	databaseName := p.ByName("database")
 	if databaseName == "" {
 		return nil, trace.BadParameter("a database name is required")
 	}
 
 	var req *updateDatabaseRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -219,7 +235,7 @@ func (h *Handler) handleDatabaseUpdate(w http.ResponseWriter, r *http.Request, p
 	savedLabels := database.GetStaticLabels()
 
 	// Make a new database to reset the check and set defaulted fields.
-	database, err = getNewDatabaseResource(createDatabaseRequest{
+	database, err = getNewDatabaseResource(createOrOverwriteDatabaseRequest{
 		Name:     databaseName,
 		Protocol: database.GetProtocol(),
 		URI:      savedOrNewURI,
@@ -229,7 +245,6 @@ func (h *Handler) handleDatabaseUpdate(w http.ResponseWriter, r *http.Request, p
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
 	database.SetCA(savedOrNewCaCert)
 	if len(req.Labels) == 0 {
 		database.SetStaticLabels(savedLabels)
@@ -239,7 +254,7 @@ func (h *Handler) handleDatabaseUpdate(w http.ResponseWriter, r *http.Request, p
 		return nil, trace.Wrap(err)
 	}
 
-	return ui.MakeDatabase(database, nil /* dbUsers */, nil /* dbNames */), nil
+	return webui.MakeDatabase(database, nil /* dbUsers */, nil /* dbNames */, false /* requiresRequest */), nil
 }
 
 // databaseIAMPolicyResponse is the response type for handleDatabaseGetIAMPolicy.
@@ -323,7 +338,15 @@ func (h *Handler) sqlServerConfigureADScriptHandle(w http.ResponseWriter, r *htt
 		return "", trace.NotFound("no proxy servers found")
 	}
 
-	certAuthority, err := getCAForSQLServerConfigureADScript(r.Context(), h.GetProxyClient())
+	clusterName, err := h.GetProxyClient().GetDomainName(r.Context())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	certAuthority, err := h.GetProxyClient().GetCertAuthority(
+		r.Context(),
+		types.CertAuthID{Type: types.DatabaseClientCA, DomainName: clusterName},
+		false,
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -354,7 +377,7 @@ func (h *Handler) sqlServerConfigureADScriptHandle(w http.ResponseWriter, r *htt
 	err = scripts.DatabaseAccessSQLServerConfigureScript.Execute(w, scripts.DatabaseAccessSQLServerConfigureParams{
 		CACertPEM:       string(keyPair.Cert),
 		CACertSHA1:      fmt.Sprintf("%X", sha1.Sum(block.Bytes)),
-		CACertBase64:    base64.StdEncoding.EncodeToString(createCertificateBlob(block.Bytes)),
+		CACertBase64:    base64.StdEncoding.EncodeToString(utils.CreateCertificateBLOB(block.Bytes)),
 		CRLPEM:          string(encodeCRLPEM(caCRL)),
 		ProxyPublicAddr: proxyServers[0].GetPublicAddr(),
 		ProvisionToken:  tokenStr,
@@ -389,7 +412,7 @@ func fetchDatabaseWithName(ctx context.Context, clt resourcesAPIGetter, r *http.
 	}
 }
 
-func getNewDatabaseResource(req createDatabaseRequest) (*types.DatabaseV3, error) {
+func getNewDatabaseResource(req createOrOverwriteDatabaseRequest) (*types.DatabaseV3, error) {
 	labels := make(map[string]string)
 	for _, label := range req.Labels {
 		labels[label.Name] = label.Value
@@ -431,32 +454,4 @@ func encodeCRLPEM(contents []byte) []byte {
 		Type:  "X509 CRL",
 		Bytes: contents,
 	})
-}
-
-// getCAForSQLServerConfigureADScript is a helper for sql server configuration
-// that fetches the DatabaseClientCA if the auth service supports it or falls back
-// to the DatabaseCA if auth service does not support it.
-// TODO(gavin): DELETE IN 16.0.0
-func getCAForSQLServerConfigureADScript(ctx context.Context, clusterAPI auth.ClientI) (types.CertAuthority, error) {
-	domainName, err := clusterAPI.GetDomainName(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	dbClientCA, err := clusterAPI.GetCertAuthority(ctx, types.CertAuthID{
-		Type:       types.DatabaseClientCA,
-		DomainName: domainName,
-	}, false)
-	if err == nil {
-		return dbClientCA, nil
-	}
-	if !types.IsUnsupportedAuthorityErr(err) {
-		return nil, trace.Wrap(err)
-	}
-
-	// fallback to DatabaseCA if DatabaseClientCA isn't supported by backend.
-	dbServerCA, err := clusterAPI.GetCertAuthority(ctx, types.CertAuthID{
-		Type:       types.DatabaseCA,
-		DomainName: domainName,
-	}, false)
-	return dbServerCA, trace.Wrap(err)
 }

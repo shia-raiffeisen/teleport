@@ -23,6 +23,7 @@ import (
 	apievents "github.com/gravitational/teleport/api/types/events"
 	prehogv1a "github.com/gravitational/teleport/gen/proto/go/prehog/v1alpha"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/srv/db/common/databaseobjectimportrule"
 )
 
 const (
@@ -135,6 +136,7 @@ func ConvertAuditEvent(event apievents.AuditEvent) Anonymizable {
 				Origin:            e.DesktopLabels[types.OriginLabel],
 				WindowsDomain:     e.Domain,
 				AllowUserCreation: e.AllowUserCreation,
+				Nla:               e.NLA,
 			},
 
 			// Note: Unlikely for this to ever be a bot session, but included
@@ -183,6 +185,7 @@ func ConvertAuditEvent(event apievents.AuditEvent) Anonymizable {
 			BotName:       e.BotName,
 			JoinMethod:    e.Method,
 			JoinTokenName: e.TokenName,
+			UserName:      e.UserName,
 		}
 
 	case *apievents.DeviceEvent2:
@@ -235,12 +238,67 @@ func ConvertAuditEvent(event apievents.AuditEvent) Anonymizable {
 			IsSuccess: e.Status.Success,
 		}
 	case *apievents.ValidateMFAAuthResponse:
+		var deviceID, deviceType string
+		if e.MFADevice != nil {
+			deviceID = e.MFADevice.DeviceID
+			deviceType = e.MFADevice.DeviceType
+		}
 		return &MFAAuthenticationEvent{
 			UserName:          e.User,
-			DeviceId:          e.MFADevice.DeviceID,
-			DeviceType:        e.MFADevice.DeviceType,
+			DeviceId:          deviceID,
+			DeviceType:        deviceType,
 			MfaChallengeScope: e.ChallengeScope,
 		}
+	case *apievents.OktaAccessListSync:
+		return &OktaAccessListSyncEvent{
+			NumAppFilters:        e.NumAppFilters,
+			NumGroupFilters:      e.NumGroupFilters,
+			NumApps:              e.NumApps,
+			NumGroups:            e.NumGroups,
+			NumRoles:             e.NumRoles,
+			NumAccessLists:       e.NumAccessLists,
+			NumAccessListMembers: e.NumAccessListMembers,
+		}
+	case *apievents.SPIFFESVIDIssued:
+		return &SPIFFESVIDIssuedEvent{
+			UserName:     e.User,
+			UserKind:     prehogUserKindFromEventKind(e.UserKind),
+			SpiffeId:     e.SPIFFEID,
+			IpSansCount:  int32(len(e.IPSANs)),
+			DnsSansCount: int32(len(e.DNSSANs)),
+			SvidType:     e.SVIDType,
+		}
+	case *apievents.DatabaseUserCreate:
+		return &DatabaseUserCreatedEvent{
+			Database: &prehogv1a.SessionStartDatabaseMetadata{
+				DbType:     e.DatabaseType,
+				DbProtocol: e.DatabaseProtocol,
+				DbOrigin:   e.DatabaseOrigin,
+			},
+			UserName: e.User,
+			NumRoles: int32(len(e.DatabaseRoles)),
+		}
+	case *apievents.DatabasePermissionUpdate:
+		out := &DatabaseUserPermissionsUpdateEvent{
+			Database: &prehogv1a.SessionStartDatabaseMetadata{
+				DbType:     e.DatabaseType,
+				DbProtocol: e.DatabaseProtocol,
+				DbOrigin:   e.DatabaseOrigin,
+			},
+			UserName:  e.User,
+			NumTables: e.AffectedObjectCounts[databaseobjectimportrule.ObjectKindTable],
+		}
+		for _, entry := range e.PermissionSummary {
+			out.NumTablesPermissions += entry.Counts[databaseobjectimportrule.ObjectKindTable]
+		}
+		return out
+	case *apievents.AccessPathChanged:
+		return &AccessGraphAccessPathChangedEvent{
+			AffectedResourceType:   e.AffectedResourceType,
+			AffectedResourceSource: e.AffectedResourceSource,
+		}
+	case *apievents.CrownJewelCreate:
+		return &AccessGraphCrownJewelCreateEvent{}
 	}
 
 	return nil

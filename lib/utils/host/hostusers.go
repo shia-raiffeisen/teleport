@@ -21,7 +21,10 @@ package host
 import (
 	"bytes"
 	"errors"
+	"os"
 	"os/exec"
+	"os/user"
+	"slices"
 	"strings"
 
 	"github.com/gravitational/trace"
@@ -30,6 +33,7 @@ import (
 
 // man GROUPADD(8), exit codes section
 const GroupExistExit = 9
+const GroupInvalidArg = 3
 
 // man USERADD(8), exit codes section
 const UserExistExit = 9
@@ -51,33 +55,76 @@ func GroupAdd(groupname string, gid string) (exitCode int, err error) {
 	cmd := exec.Command(groupaddBin, args...)
 	output, err := cmd.CombinedOutput()
 	log.Debugf("%s output: %s", cmd.Path, string(output))
-	if cmd.ProcessState.ExitCode() == GroupExistExit {
-		return cmd.ProcessState.ExitCode(), trace.AlreadyExists("group already exists")
+
+	switch code := cmd.ProcessState.ExitCode(); code {
+	case GroupExistExit:
+		return code, trace.AlreadyExists("group already exists")
+	case GroupInvalidArg:
+		errMsg := "bad parameter"
+		if strings.Contains(string(output), "not a valid group name") {
+			errMsg = "invalid group name"
+		}
+		return code, trace.BadParameter(errMsg)
+	default:
+		return code, trace.Wrap(err)
 	}
-	return cmd.ProcessState.ExitCode(), trace.Wrap(err)
+}
+
+// UserOpts allow for customizing the resulting command for adding a new user.
+type UserOpts struct {
+	// UID a user should be created with. When empty, the UID is determined by the
+	// useradd command.
+	UID string
+	// GID a user should be assigned to on creation. When empty, a group of the same name
+	// as the user will be used.
+	GID string
+	// Home directory for a user. When empty, this will be the root directory to match
+	// OpenSSH behavior.
+	Home string
+	// Shell that the user should use when logging in. When empty, the default shell
+	// for the host is used (typically /usr/bin/sh).
+	Shell string
 }
 
 // UserAdd creates a user on a host using `useradd`
-func UserAdd(username string, groups []string, home, uid, gid string) (exitCode int, err error) {
+func UserAdd(username string, groups []string, opts UserOpts) (exitCode int, err error) {
 	useraddBin, err := exec.LookPath("useradd")
 	if err != nil {
 		return -1, trace.Wrap(err, "cant find useradd binary")
 	}
 
-	if home == "" {
-		return -1, trace.BadParameter("home is a required parameter")
+	if opts.Home == "" {
+		// Users without a home directory should land at the root, to match OpenSSH behavior.
+		opts.Home = string(os.PathSeparator)
+	}
+
+	// user's without an explicit gid should be added to the group that shares their
+	// login name if it's defined, otherwise user creation will fail because their primary
+	// group already exists
+	if slices.Contains(groups, username) && opts.GID == "" {
+		opts.GID = username
 	}
 
 	// useradd ---no-create-home (username) (groups)...
-	args := []string{"--no-create-home", "--home-dir", home, username}
+	args := []string{"--no-create-home", "--home-dir", opts.Home, username}
 	if len(groups) != 0 {
 		args = append(args, "--groups", strings.Join(groups, ","))
 	}
-	if uid != "" {
-		args = append(args, "--uid", uid)
+
+	if opts.UID != "" {
+		args = append(args, "--uid", opts.UID)
 	}
-	if gid != "" {
-		args = append(args, "--gid", gid)
+
+	if opts.GID != "" {
+		args = append(args, "--gid", opts.GID)
+	}
+
+	if opts.Shell != "" {
+		if shell, err := exec.LookPath(opts.Shell); err != nil {
+			log.Warnf("configured shell %q not found, falling back to host default", opts.Shell)
+		} else {
+			args = append(args, "--shell", shell)
+		}
 	}
 
 	cmd := exec.Command(useraddBin, args...)
@@ -89,17 +136,15 @@ func UserAdd(username string, groups []string, home, uid, gid string) (exitCode 
 	return cmd.ProcessState.ExitCode(), trace.Wrap(err)
 }
 
-// AddUserToGroups adds a user to a list of specified groups on a host using `usermod`
-func AddUserToGroups(username string, groups []string) (exitCode int, err error) {
+// SetUserGroups adds a user to a list of specified groups on a host using `usermod`,
+// overriding any existing supplementary groups.
+func SetUserGroups(username string, groups []string) (exitCode int, err error) {
 	usermodBin, err := exec.LookPath("usermod")
 	if err != nil {
 		return -1, trace.Wrap(err, "cant find usermod binary")
 	}
-	args := []string{"-aG"}
-	args = append(args, groups...)
-	args = append(args, username)
-	// usermod -aG (append groups) (username)
-	cmd := exec.Command(usermodBin, args...)
+	// usermod -G (replace groups) (username)
+	cmd := exec.Command(usermodBin, "-G", strings.Join(groups, ","), username)
 	output, err := cmd.CombinedOutput()
 	log.Debugf("%s output: %s", cmd.Path, string(output))
 	return cmd.ProcessState.ExitCode(), trace.Wrap(err)
@@ -109,10 +154,20 @@ func AddUserToGroups(username string, groups []string) (exitCode int, err error)
 func UserDel(username string) (exitCode int, err error) {
 	userdelBin, err := exec.LookPath("userdel")
 	if err != nil {
-		return -1, trace.Wrap(err, "cant find userdel binary")
+		return -1, trace.NotFound("cant find userdel binary: %s", err)
 	}
+	u, err := user.Lookup(username)
+	if err != nil {
+		return -1, trace.Wrap(err)
+	}
+	args := make([]string, 0, 2)
+	// Only remove the home dir if it exists and isn't the root.
+	if u.HomeDir != "" && u.HomeDir != string(os.PathSeparator) {
+		args = append(args, "--remove")
+	}
+	args = append(args, username)
 	// userdel --remove (remove home) username
-	cmd := exec.Command(userdelBin, "--remove", username)
+	cmd := exec.Command(userdelBin, args...)
 	output, err := cmd.CombinedOutput()
 	log.Debugf("%s output: %s", cmd.Path, string(output))
 	return cmd.ProcessState.ExitCode(), trace.Wrap(err)
@@ -121,7 +176,7 @@ func UserDel(username string) (exitCode int, err error) {
 func GetAllUsers() ([]string, int, error) {
 	getentBin, err := exec.LookPath("getent")
 	if err != nil {
-		return nil, -1, trace.Wrap(err, "cant find getent binary")
+		return nil, -1, trace.NotFound("cant find getent binary: %s", err)
 	}
 	// getent passwd
 	cmd := exec.Command(getentBin, "passwd")

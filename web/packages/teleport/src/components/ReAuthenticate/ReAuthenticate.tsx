@@ -47,7 +47,6 @@ export function ReAuthenticate({
   auth2faType,
   preferredMfaType,
   actionText,
-  challengeScope,
 }: State) {
   const [otpToken, setOtpToken] = useState('');
   const mfaOptions = createMfaOptions({
@@ -61,7 +60,7 @@ export function ReAuthenticate({
     e.preventDefault();
 
     if (mfaOption?.value === 'webauthn') {
-      submitWithWebauthn(challengeScope);
+      submitWithWebauthn();
     }
     if (mfaOption?.value === 'otp') {
       submitWithTotp(otpToken);
@@ -93,7 +92,7 @@ export function ReAuthenticate({
               </Danger>
             )}
             <DialogContent>
-              <Flex mt={2} alignItems="flex-end">
+              <Flex mt={2} alignItems="flex-start">
                 <FieldSelect
                   width="60%"
                   label="Two-factor Type"

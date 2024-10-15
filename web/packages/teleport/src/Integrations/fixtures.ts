@@ -16,7 +16,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { IntegrationStatusCode } from 'teleport/services/integrations';
+import {
+  IntegrationKind,
+  IntegrationStatusCode,
+} from 'teleport/services/integrations';
 
 import type {
   Plugin,
@@ -129,22 +132,31 @@ export const plugins: Plugin[] = [
     statusCode: IntegrationStatusCode.Running,
     spec: {},
   },
+  {
+    resourceType: 'plugin',
+    name: 'entra-id',
+    details: '',
+    kind: 'entra-id',
+    statusCode: IntegrationStatusCode.Running,
+    spec: {},
+  },
+  {
+    resourceType: 'plugin',
+    name: 'datadog',
+    details: '',
+    kind: 'datadog',
+    statusCode: IntegrationStatusCode.Running,
+    spec: {},
+  },
 ];
 
 export const integrations: Integration[] = [
   {
     resourceType: 'integration',
     name: 'aws',
-    kind: 'aws-oidc',
+    kind: IntegrationKind.AwsOidc,
     statusCode: IntegrationStatusCode.Running,
-    spec: { roleArn: '' },
-  },
-  {
-    resourceType: 'integration',
-    name: 'some-integration-name',
-    kind: '' as any,
-    statusCode: IntegrationStatusCode.Running,
-    spec: { roleArn: '' },
+    spec: { roleArn: '', issuerS3Prefix: '', issuerS3Bucket: '' },
   },
 ];
 

@@ -18,6 +18,8 @@
 
 import { MatchCallback } from 'design/utils/match';
 
+import { State } from './useTable';
+
 export type TableProps<T> = {
   data: T[];
   columns: TableColumn<T>[];
@@ -32,7 +34,23 @@ export type TableProps<T> = {
    * error.
    */
   emptyHint?: string;
-  pagination?: PaginationConfig;
+  pagination?: PaginationConfig<T>;
+  /**
+   * config for client searching.
+   * supports any table except when "serversideProps"
+   * field is defined
+   */
+  clientSearch?: {
+    /**
+     * By default, no initial search is applied (empty search),
+     * unless "initialSearchValue" is defined.
+     */
+    initialSearchValue: string;
+    /**
+     * After setting a new search value, this function will be called.
+     */
+    onSearchValueChange(searchString: string): void;
+  };
   isSearchable?: boolean;
   searchableProps?: Extract<keyof T, string>[];
   // customSearchMatchers contains custom functions to run when search matching.
@@ -52,6 +70,16 @@ export type TableProps<T> = {
   // any client table filtering supplied by default.
   // Use case: filtering is done on the caller side e.g. server side.
   disableFilter?: boolean;
+  /**
+   * row configuration
+   */
+  row?: {
+    onClick?(row: T): void;
+    /**
+     * conditionally style a row (eg: cursor: pointer, disabled)
+     */
+    getStyle?(row: T): React.CSSProperties;
+  };
 };
 
 type TableColumnBase<T> = {
@@ -66,9 +94,20 @@ type TableColumnBase<T> = {
   isNonRender?: boolean;
 };
 
-export type PaginationConfig = {
+export type PagerPosition = 'top' | 'bottom' | 'both';
+
+export type PaginationConfig<T> = {
   pageSize?: number;
-  pagerPosition?: 'top' | 'bottom';
+  /**
+   * "undefined" will show both pagers if data on current page is some
+   * sufficient length.
+   *
+   * Otherwise, it will only show the top pager.
+   *
+   * "both" will show both regardless of data length.
+   */
+  pagerPosition?: PagerPosition;
+  CustomTable?: (p: PagedTableProps<T>) => JSX.Element;
 };
 
 /**
@@ -102,7 +141,7 @@ export type ServersideProps = {
 
 // Makes it so either key or altKey is required
 type TableColumnWithKey<T> = TableColumnBase<T> & {
-  key: Extract<keyof T, string>;
+  key: keyof T & string;
   // altSortKey is the alternative field to sort column by,
   // if provided. Otherwise it falls back to sorting by field
   // "key".
@@ -148,4 +187,32 @@ export type LabelDescription = {
 
 export type CustomSort = SortType & {
   onSort(s: SortType): void;
+};
+
+export type BasicTableProps<T> = {
+  data: T[];
+  renderHeaders: () => JSX.Element;
+  renderBody: (data: T[]) => JSX.Element;
+  className?: string;
+  style?: React.CSSProperties;
+};
+
+export type SearchableBasicTableProps<T> = BasicTableProps<T> & {
+  searchValue: string;
+  setSearchValue: (searchValue: string) => void;
+};
+
+export type PagedTableProps<T> = SearchableBasicTableProps<T> & {
+  nextPage: () => void;
+  prevPage: () => void;
+  pagination: State<T>['state']['pagination'];
+  fetching?: State<T>['fetching'];
+};
+
+export type ServersideTableProps<T> = BasicTableProps<T> & {
+  nextPage: () => void;
+  prevPage: () => void;
+  pagination: State<T>['state']['pagination'];
+  serversideProps: State<T>['serversideProps'];
+  fetchStatus?: FetchStatus;
 };
